@@ -2137,18 +2137,6 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
   const bool portmasterNoVertexStorage =
       portmaster_no_vertex_storage_mode() && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
-  if (portmasterNoVertexStorage && can_expand_index16_pos_color(fmt, vtxSize)) {
-    if (portmaster_gx_debug_log_allowed()) {
-      Log.info("PortMaster GX expand INDEX16 draw: prim={} fmt={} vtxCount={} fifoStride={}", static_cast<u32>(prim),
-               static_cast<u32>(fmt), vtxCount, vtxSize);
-    }
-    auto expanded = expand_index16_pos_color(data, pos, vtxCount, vtxSize, bigEndian);
-    portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded.size(), PortmasterExpandPath::Index16PosColor);
-    pos += totalVtxBytes;
-    const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
-    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
-    return;
-  }
   if (portmasterNoVertexStorage && can_expand_direct_pos_tex(fmt, vtxSize)) {
     if (portmaster_gx_debug_log_allowed()) {
       Log.info("PortMaster GX expand DIRECT POS+TEX0 draw: prim={} fmt={} vtxCount={} fifoStride={}",

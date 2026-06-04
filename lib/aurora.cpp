@@ -94,7 +94,8 @@ bool initialize() noexcept {
     g_state.fd = -1;
     return false;
   }
-  g_state.bytes = static_cast<size_t>(g_state.fix.line_length) * g_state.var.yres;
+  const uint32_t virtualHeight = std::max(g_state.var.yres, g_state.var.yres_virtual);
+  g_state.bytes = static_cast<size_t>(g_state.fix.line_length) * virtualHeight;
   g_state.pixels = static_cast<uint8_t*>(mmap(nullptr, g_state.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, g_state.fd, 0));
   if (g_state.pixels == MAP_FAILED) {
     Log.warn("PortMaster fbdev presenter failed to mmap /dev/fb0: {}", std::strerror(errno));
@@ -104,8 +105,9 @@ bool initialize() noexcept {
     return false;
   }
   g_state.available = true;
-  Log.warn("PortMaster fbdev presenter active: {}x{} {}bpp stride {}", g_state.var.xres, g_state.var.yres,
-           g_state.var.bits_per_pixel, g_state.fix.line_length);
+  Log.warn("PortMaster fbdev presenter active: {}x{} virtual {}x{} {}bpp stride {}", g_state.var.xres,
+           g_state.var.yres, g_state.var.xres_virtual, g_state.var.yres_virtual, g_state.var.bits_per_pixel,
+           g_state.fix.line_length);
   return true;
 }
 
@@ -179,25 +181,30 @@ void write_fb(const uint8_t* src) noexcept {
   if (bytesPerPixel != 4u && bytesPerPixel != 2u) {
     return;
   }
+  const uint32_t virtualHeight = std::max(g_state.var.yres, g_state.var.yres_virtual);
+  const uint32_t pageCount = std::max(1u, virtualHeight / dstHeight);
   for (uint32_t y = 0; y < dstHeight; ++y) {
     const uint32_t sy = std::min(srcHeight - 1u, static_cast<uint32_t>((static_cast<uint64_t>(y) * srcHeight) / dstHeight));
     const uint8_t* srcRow = src + static_cast<size_t>(sy) * g_state.readbackStride;
-    uint8_t* dstRow = g_state.pixels + static_cast<size_t>(y) * g_state.fix.line_length;
-    for (uint32_t x = 0; x < dstWidth; ++x) {
-      const uint32_t sx = std::min(srcWidth - 1u, static_cast<uint32_t>((static_cast<uint64_t>(x) * srcWidth) / dstWidth));
-      const uint8_t* p = srcRow + static_cast<size_t>(sx) * 4u;
-      const uint8_t r = p[0];
-      const uint8_t g = p[1];
-      const uint8_t b = p[2];
-      if (bytesPerPixel == 4u) {
-        uint8_t* d = dstRow + static_cast<size_t>(x) * 4u;
-        d[0] = b;
-        d[1] = g;
-        d[2] = r;
-        d[3] = 0xff;
-      } else {
-        auto* d = reinterpret_cast<uint16_t*>(dstRow + static_cast<size_t>(x) * 2u);
-        *d = static_cast<uint16_t>(((r >> 3u) << 11u) | ((g >> 2u) << 5u) | (b >> 3u));
+    for (uint32_t page = 0; page < pageCount; ++page) {
+      uint8_t* dstRow = g_state.pixels + static_cast<size_t>(page * dstHeight + y) * g_state.fix.line_length;
+      for (uint32_t x = 0; x < dstWidth; ++x) {
+        const uint32_t sx =
+            std::min(srcWidth - 1u, static_cast<uint32_t>((static_cast<uint64_t>(x) * srcWidth) / dstWidth));
+        const uint8_t* p = srcRow + static_cast<size_t>(sx) * 4u;
+        const uint8_t r = p[0];
+        const uint8_t g = p[1];
+        const uint8_t b = p[2];
+        if (bytesPerPixel == 4u) {
+          uint8_t* d = dstRow + static_cast<size_t>(x) * 4u;
+          d[0] = b;
+          d[1] = g;
+          d[2] = r;
+          d[3] = 0xff;
+        } else {
+          auto* d = reinterpret_cast<uint16_t*>(dstRow + static_cast<size_t>(x) * 2u);
+          *d = static_cast<uint16_t>(((r >> 3u) << 11u) | ((g >> 2u) << 5u) | (b >> 3u));
+        }
       }
     }
   }
