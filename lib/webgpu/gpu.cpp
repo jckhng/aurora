@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <string_view>
@@ -59,6 +60,10 @@ bool g_bcTexturesSupported;
 bool g_textureComponentSwizzleSupported;
 
 namespace {
+
+bool no_surface_mode() noexcept {
+  return std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr;
+}
 
 struct ResampleUniformBlock {
   uint32_t samplerMode = 0;
@@ -662,6 +667,10 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
 }
 
 static bool create_surface() {
+  if (std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr) {
+    release_surface();
+    return true;
+  }
   SDL_Window* window = window::get_sdl_window();
   if (window == nullptr) {
     Log.error("Failed to create surface: no window");
@@ -720,10 +729,15 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     }
   }
   {
+    wgpu::FeatureLevel featureLevel = wgpu::FeatureLevel::Undefined;
+    if (backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) {
+      featureLevel = wgpu::FeatureLevel::Compatibility;
+    }
     const wgpu::RequestAdapterOptions options{
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
-        .compatibleSurface = g_surface,
+        .featureLevel = featureLevel,
+        .compatibleSurface = std::getenv("DUSKLIGHT_PORTMASTER_SKIP_COMPAT_SURFACE") == nullptr ? g_surface : nullptr,
     };
     const auto future = g_instance.RequestAdapter(
         &options, wgpu::CallbackMode::WaitAnyOnly,
@@ -906,6 +920,35 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     });
   }
   g_queue = g_device.GetQueue();
+
+  if (no_surface_mode()) {
+    Log.warn("DUSKLIGHT_PORTMASTER_NO_SURFACE set; using diagnostic offscreen render targets");
+    const auto size = window::get_window_size();
+    const uint32_t fbWidth = std::max<uint32_t>(1u, size.fb_width);
+    const uint32_t fbHeight = std::max<uint32_t>(1u, size.fb_height);
+    const uint32_t nativeFbWidth = std::max<uint32_t>(1u, size.native_fb_width);
+    const uint32_t nativeFbHeight = std::max<uint32_t>(1u, size.native_fb_height);
+    g_graphicsConfig = GraphicsConfig{
+        .surfaceConfiguration =
+            wgpu::SurfaceConfiguration{
+                .format = wgpu::TextureFormat::RGBA8Unorm,
+                .usage = wgpu::TextureUsage::RenderAttachment,
+                .width = nativeFbWidth,
+                .height = nativeFbHeight,
+                .presentMode = wgpu::PresentMode::Fifo,
+            },
+        .depthFormat = wgpu::TextureFormat::Depth32Float,
+        .msaaSamples = g_config.msaa,
+        .textureAnisotropy = g_config.maxTextureAnisotropy,
+    };
+    create_copy_pipeline();
+    create_resample_pipeline();
+    g_frameBuffer = create_render_texture(fbWidth, fbHeight, true);
+    g_frameBufferResolved = create_render_texture(fbWidth, fbHeight, false);
+    g_depthBuffer = create_depth_texture(fbWidth, fbHeight);
+    g_CopyBindGroup = create_copy_bind_group(present_source());
+    return true;
+  }
 
   const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
   if (status != wgpu::Status::Success) {

@@ -14,9 +14,10 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   uint32_t dstAlpha;
+  bool nativeVertexFetch;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 13;
+constexpr uint32_t GXPipelineConfigVersion = 15;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;

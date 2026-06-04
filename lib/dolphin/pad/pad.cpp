@@ -1381,7 +1381,8 @@ void __PADWriteDeadZones(SDL_IOStream* file, // NOLINT(*-reserved-identifier)
 void PADSerializeMappings() {
   const std::filesystem::path basePath{aurora::g_config.userPath};
 
-  for (auto& controller : aurora::input::g_GameControllers | std::views::values) {
+  for (auto& [controllerId, controller] : aurora::input::g_GameControllers) {
+    static_cast<void>(controllerId);
     EnsureMappingLoaded(&controller);
     const auto filePath =
         basePath / fmt::format("{}_{:04X}_{:04X}.controller", aurora::input::controller_name(controller.m_index),

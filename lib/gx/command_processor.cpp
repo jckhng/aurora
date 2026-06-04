@@ -11,12 +11,31 @@
 #include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
+
+static bool portmaster_gx_debug_enabled() {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_GX_DEBUG");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool portmaster_gx_debug_log_allowed() {
+  if (!portmaster_gx_debug_enabled()) {
+    return false;
+  }
+  static u32 remaining = 200;
+  if (remaining == 0) {
+    return false;
+  }
+  --remaining;
+  return true;
+}
 
 static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) {
   u16 numIndices = 0;
@@ -1530,7 +1549,369 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
   return vtxSize;
 }
 
-static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange);
+static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
+                                 bool forceNativePosColor = false, const ShaderConfig* forcedNativeShaderConfig = nullptr);
+
+struct CpuExpandedDraw {
+  ByteBuffer vertices;
+  ShaderConfig shaderConfig;
+};
+
+static bool portmaster_no_vertex_storage_mode() {
+  return std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr;
+}
+
+static u8 canonical_attr_size(GXAttr attr) {
+  if (attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) {
+    return 4;
+  }
+  if (attr == GX_VA_POS || attr == GX_VA_NRM) {
+    return 12;
+  }
+  if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+    return 4;
+  }
+  if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
+    return 8;
+  }
+  return 0;
+}
+
+static void append_f32_attr(ByteBuffer& out, const std::array<float, 4>& values, u8 count) {
+  for (u8 i = 0; i < count; ++i) {
+    out.append(values[i]);
+  }
+}
+
+static float read_component_as_float(const u8* ptr, GXCompType type, u8 frac, bool bigEndian) {
+  const float scale = frac == 0 ? 1.0f : 1.0f / static_cast<float>(1u << frac);
+  switch (type) {
+  case GX_U8:
+    return static_cast<float>(*ptr) * scale;
+  case GX_S8:
+    return static_cast<float>(*reinterpret_cast<const int8_t*>(ptr)) * scale;
+  case GX_U16:
+    return static_cast<float>(read_u16(ptr, bigEndian)) * scale;
+  case GX_S16:
+    return static_cast<float>(static_cast<int16_t>(read_u16(ptr, bigEndian))) * scale;
+  case GX_F32:
+    return read_f32(ptr, bigEndian);
+  default:
+    FATAL("PortMaster CPU vertex expansion: unsupported numeric component type {}", type);
+  }
+}
+
+static u8 float_to_unorm8(float value) {
+  return static_cast<u8>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+}
+
+static std::array<u8, 4> read_color_as_rgba8(const u8* ptr, GXCompType type, bool bigEndian) {
+  switch (type) {
+  case GX_RGB565: {
+    const u16 v = read_u16(ptr, bigEndian);
+    return {
+        static_cast<u8>(((v >> 11) & 0x1f) * 255 / 31),
+        static_cast<u8>(((v >> 5) & 0x3f) * 255 / 63),
+        static_cast<u8>((v & 0x1f) * 255 / 31),
+        255,
+    };
+  }
+  case GX_RGB8:
+    return {ptr[0], ptr[1], ptr[2], 255};
+  case GX_RGBX8:
+  case GX_RGBA8:
+    return {ptr[0], ptr[1], ptr[2], ptr[3]};
+  case GX_RGBA4: {
+    const u16 v = read_u16(ptr, bigEndian);
+    return {
+        static_cast<u8>(((v >> 12) & 0x0f) * 17),
+        static_cast<u8>(((v >> 8) & 0x0f) * 17),
+        static_cast<u8>(((v >> 4) & 0x0f) * 17),
+        static_cast<u8>((v & 0x0f) * 17),
+    };
+  }
+  case GX_RGBA6: {
+    const u32 v = bigEndian ? (static_cast<u32>(ptr[0]) << 16) | (static_cast<u32>(ptr[1]) << 8) | ptr[2]
+                            : (static_cast<u32>(ptr[2]) << 16) | (static_cast<u32>(ptr[1]) << 8) | ptr[0];
+    return {
+        static_cast<u8>(((v >> 18) & 0x3f) * 255 / 63),
+        static_cast<u8>(((v >> 12) & 0x3f) * 255 / 63),
+        static_cast<u8>(((v >> 6) & 0x3f) * 255 / 63),
+        static_cast<u8>((v & 0x3f) * 255 / 63),
+    };
+  }
+  default:
+    FATAL("PortMaster CPU vertex expansion: unsupported color component type {}", type);
+  }
+}
+
+static bool build_portmaster_native_shader_config(GXVtxFmt fmt, ShaderConfig& out) {
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  uint32_t nativeLocationCount = 0;
+  u8 outOffset = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto type = g_gxState.vtxDesc[i];
+    auto& mapping = out.attrs[i];
+    if (type == GX_NONE) {
+      mapping = {};
+      continue;
+    }
+    const u8 size = canonical_attr_size(attr);
+    if (size == 0) {
+      return false;
+    }
+    const auto& attrFmt = vtxFmt.attrs[i];
+    mapping = AttrConfig{
+        .attrType = GX_DIRECT,
+        .cnt = comp_cnt_count(attr, attrFmt.cnt),
+        .compType = static_cast<u8>(attrFmt.type),
+        .offset = outOffset,
+        .stride = 0,
+        .frac = 0,
+        .le = false,
+    };
+    if (attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) {
+      mapping.cnt = 1;
+      mapping.compType = GX_U8;
+    } else if (attr == GX_VA_POS || attr == GX_VA_NRM || (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7)) {
+      mapping.compType = GX_F32;
+      mapping.cnt = attr >= GX_VA_TEX0 ? 2 : 3;
+    } else if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+      mapping.compType = GX_RGBA8;
+      mapping.cnt = 1;
+    }
+    outOffset += size;
+    ++nativeLocationCount;
+  }
+  if (nativeLocationCount > 16) {
+    if (portmaster_gx_debug_enabled()) {
+      Log.info("PortMaster GX generic expansion skipped: {} native vertex attrs would exceed GLES-safe limit",
+               nativeLocationCount);
+    }
+    return false;
+  }
+  out.vtxStride = outOffset;
+  out.nativeVertexFetch = true;
+  return out.attrs[GX_VA_POS].attrType == GX_DIRECT;
+}
+
+static void append_portmaster_native_attr(ByteBuffer& out, GXAttr attr, const u8* src, const VtxAttrFmt& attrFmt,
+                                          bool bigEndian) {
+  if (attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) {
+    const u32 index = attr == GX_VA_PNMTXIDX ? static_cast<u32>(*src) / 3u : static_cast<u32>(*src);
+    out.append(index);
+    return;
+  }
+
+  if (attr == GX_VA_POS || attr == GX_VA_NRM || (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7)) {
+    const u8 count = comp_cnt_count(attr, attrFmt.cnt);
+    const u8 compSize = comp_type_size(attr, attrFmt.type);
+    std::array<float, 4> values{0.0f, 0.0f, 0.0f, 1.0f};
+    for (u8 i = 0; i < count; ++i) {
+      values[i] = read_component_as_float(src + i * compSize, attrFmt.type, attrFmt.frac, bigEndian);
+    }
+    if (attr == GX_VA_POS || attr == GX_VA_NRM) {
+      append_f32_attr(out, values, 3);
+    } else {
+      append_f32_attr(out, values, 2);
+    }
+    return;
+  }
+
+  if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+    const auto color = read_color_as_rgba8(src, attrFmt.type, bigEndian);
+    out.append(color);
+    return;
+  }
+
+  FATAL("PortMaster CPU vertex expansion: unsupported attr {}", attr);
+}
+
+static std::optional<CpuExpandedDraw> expand_portmaster_generic_draw(GXVtxFmt fmt, const u8* data, u32 pos,
+                                                                     u16 vtxCount, u32 vtxSize, bool bigEndian) {
+  CpuExpandedDraw expanded;
+  if (!build_portmaster_native_shader_config(fmt, expanded.shaderConfig)) {
+    return std::nullopt;
+  }
+
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  for (u16 v = 0; v < vtxCount; ++v) {
+    const auto* fifoVertex = data + pos + v * vtxSize;
+    u32 srcOffset = 0;
+    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+      const auto attr = static_cast<GXAttr>(i);
+      const auto type = g_gxState.vtxDesc[i];
+      if (type == GX_NONE) {
+        continue;
+      }
+      const auto& attrFmt = vtxFmt.attrs[i];
+      const u8 directSize = comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      const u8 indexSize = type == GX_INDEX8 ? 1 : 2;
+      const u8 consumedSize = type == GX_DIRECT ? directSize : indexSize;
+      CHECK(srcOffset + consumedSize <= vtxSize, "PortMaster CPU vertex expansion overran FIFO vertex");
+
+      const u8* attrSrc = fifoVertex + srcOffset;
+      bool attrBigEndian = bigEndian;
+      if (type == GX_INDEX8 || type == GX_INDEX16) {
+        const u16 idx = type == GX_INDEX8 ? attrSrc[0] : read_u16(attrSrc, bigEndian);
+        const auto& array = g_gxState.arrays[i];
+        CHECK(array.data != nullptr, "PortMaster CPU vertex expansion missing array for attr {}", attr);
+        const u32 arrayOffset = static_cast<u32>(idx) * array.stride;
+        CHECK(arrayOffset + directSize <= array.size, "PortMaster CPU vertex expansion attr {} index {} out of bounds",
+              attr, idx);
+        attrSrc = static_cast<const u8*>(array.data) + arrayOffset;
+        attrBigEndian = !array.le;
+      }
+      append_portmaster_native_attr(expanded.vertices, attr, attrSrc, attrFmt, attrBigEndian);
+      srcOffset += consumedSize;
+    }
+  }
+  return expanded;
+}
+
+static bool can_expand_index16_pos_color(GXVtxFmt fmt, u32 vtxSize) {
+  if ((vtxSize != 4 && vtxSize != 6 && vtxSize != 8) || g_gxState.vtxDesc[GX_VA_POS] != GX_INDEX16) {
+    return false;
+  }
+  const bool hasNrm = g_gxState.vtxDesc[GX_VA_NRM] == GX_INDEX16;
+  const bool hasClr = g_gxState.vtxDesc[GX_VA_CLR0] == GX_INDEX16;
+  const bool hasTex = g_gxState.vtxDesc[GX_VA_TEX0] == GX_INDEX16;
+  if (!hasClr && !hasTex) {
+    return false;
+  }
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    if (i == GX_VA_POS || (hasNrm && i == GX_VA_NRM) || (hasClr && i == GX_VA_CLR0) ||
+        (hasTex && i == GX_VA_TEX0)) {
+      continue;
+    }
+    if (g_gxState.vtxDesc[i] != GX_NONE) {
+      return false;
+    }
+  }
+
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  const auto& posFmt = vtxFmt.attrs[GX_VA_POS];
+  const auto& nrmFmt = vtxFmt.attrs[GX_VA_NRM];
+  const auto& clrFmt = vtxFmt.attrs[GX_VA_CLR0];
+  const auto& texFmt = vtxFmt.attrs[GX_VA_TEX0];
+  const auto& posArray = g_gxState.arrays[GX_VA_POS];
+  const auto& nrmArray = g_gxState.arrays[GX_VA_NRM];
+  const auto& clrArray = g_gxState.arrays[GX_VA_CLR0];
+  const auto& texArray = g_gxState.arrays[GX_VA_TEX0];
+  const bool posMatches = comp_cnt_count(GX_VA_POS, posFmt.cnt) == 3 && posFmt.type == GX_F32 &&
+                          posArray.data != nullptr && posArray.stride == 12;
+  const bool nrmMatches = !hasNrm || (comp_cnt_count(GX_VA_NRM, nrmFmt.cnt) == 3 && nrmFmt.type == GX_S16 &&
+                                      nrmFmt.frac == 14 && nrmArray.data != nullptr && nrmArray.stride == 6);
+  const bool clrMatches = !hasClr || (comp_cnt_count(GX_VA_CLR0, clrFmt.cnt) == 1 && clrFmt.type == GX_RGBA8 &&
+                                      clrArray.data != nullptr && clrArray.stride == 4);
+  const bool texMatches = !hasTex || (comp_cnt_count(GX_VA_TEX0, texFmt.cnt) == 2 && texFmt.type == GX_S16 &&
+                                      texArray.data != nullptr && texArray.stride == 4);
+  const bool baseMatches = posMatches && nrmMatches && clrMatches && texMatches;
+  if (!baseMatches) {
+    return baseMatches;
+  }
+  return 2u + (hasNrm ? 2u : 0u) + (hasClr ? 2u : 0u) + (hasTex ? 2u : 0u) == vtxSize;
+}
+
+static ByteBuffer expand_index16_pos_color(const u8* data, u32 pos, u16 vtxCount, u32 vtxSize, bool bigEndian) {
+  const bool hasNrm = g_gxState.vtxDesc[GX_VA_NRM] == GX_INDEX16;
+  const bool hasClr = g_gxState.vtxDesc[GX_VA_CLR0] == GX_INDEX16;
+  const bool hasTex = g_gxState.vtxDesc[GX_VA_TEX0] == GX_INDEX16;
+  const u32 nrmIndexOffset = 2;
+  const u32 clrIndexOffset = 2 + (hasNrm ? 2 : 0);
+  const u32 texIndexOffset = 2 + (hasNrm ? 2 : 0) + (hasClr ? 2 : 0);
+  const auto& posArray = g_gxState.arrays[GX_VA_POS];
+  const auto& nrmArray = g_gxState.arrays[GX_VA_NRM];
+  const auto& clrArray = g_gxState.arrays[GX_VA_CLR0];
+  const auto& texArray = g_gxState.arrays[GX_VA_TEX0];
+  const auto& nrmFmt = g_gxState.vtxFmts[g_gxState.lastVtxFmt].attrs[GX_VA_NRM];
+  const auto& texFmt = g_gxState.vtxFmts[g_gxState.lastVtxFmt].attrs[GX_VA_TEX0];
+  const float nrmScale = hasNrm ? 1.0f / static_cast<float>(1u << nrmFmt.frac) : 1.0f;
+  const float texScale = hasTex ? 1.0f / static_cast<float>(1u << texFmt.frac) : 1.0f;
+  ByteBuffer expanded;
+  for (u16 v = 0; v < vtxCount; ++v) {
+    const auto* indexData = data + pos + v * vtxSize;
+    const u16 posIdx = read_u16(indexData, bigEndian);
+    const u16 nrmIdx = hasNrm ? read_u16(indexData + nrmIndexOffset, bigEndian) : 0;
+    const u16 clrIdx = hasClr ? read_u16(indexData + clrIndexOffset, bigEndian) : 0;
+    const u16 texIdx = hasTex ? read_u16(indexData + texIndexOffset, bigEndian) : 0;
+    const auto posOffset = static_cast<u32>(posIdx) * posArray.stride;
+    const auto nrmOffset = static_cast<u32>(nrmIdx) * nrmArray.stride;
+    const auto clrOffset = static_cast<u32>(clrIdx) * clrArray.stride;
+    const auto texOffset = static_cast<u32>(texIdx) * texArray.stride;
+    CHECK(posOffset + 12 <= posArray.size, "POS array index {} out of bounds for size {}", posIdx, posArray.size);
+    const auto* posData = static_cast<const u8*>(posArray.data) + posOffset;
+    const std::array position{
+        read_f32(posData, !posArray.le),
+        read_f32(posData + 4, !posArray.le),
+        read_f32(posData + 8, !posArray.le),
+    };
+    expanded.append(position);
+    if (hasNrm) {
+      CHECK(nrmOffset + 6 <= nrmArray.size, "NRM array index {} out of bounds for size {}", nrmIdx, nrmArray.size);
+      const auto* nrmData = static_cast<const u8*>(nrmArray.data) + nrmOffset;
+      const int16_t x = static_cast<int16_t>(read_u16(nrmData, !nrmArray.le));
+      const int16_t y = static_cast<int16_t>(read_u16(nrmData + 2, !nrmArray.le));
+      const int16_t z = static_cast<int16_t>(read_u16(nrmData + 4, !nrmArray.le));
+      const std::array nrm{static_cast<float>(x) * nrmScale, static_cast<float>(y) * nrmScale,
+                           static_cast<float>(z) * nrmScale};
+      expanded.append(nrm);
+    }
+    if (hasClr) {
+      CHECK(clrOffset + 4 <= clrArray.size, "CLR0 array index {} out of bounds for size {}", clrIdx, clrArray.size);
+      expanded.append(static_cast<const u8*>(clrArray.data) + clrOffset, 4);
+    } else {
+      constexpr std::array<u8, 4> white{255, 255, 255, 255};
+      expanded.append(white);
+    }
+    if (hasTex) {
+      CHECK(texOffset + 4 <= texArray.size, "TEX0 array index {} out of bounds for size {}", texIdx, texArray.size);
+      const auto* texData = static_cast<const u8*>(texArray.data) + texOffset;
+      const int16_t s = static_cast<int16_t>(read_u16(texData, !texArray.le));
+      const int16_t t = static_cast<int16_t>(read_u16(texData + 2, !texArray.le));
+      const std::array tex{static_cast<float>(s) * texScale, static_cast<float>(t) * texScale};
+      expanded.append(tex);
+    }
+  }
+  return expanded;
+}
+
+static bool can_expand_direct_pos_tex(GXVtxFmt fmt, u32 vtxSize) {
+  if (vtxSize != 16 || g_gxState.vtxDesc[GX_VA_POS] != GX_DIRECT || g_gxState.vtxDesc[GX_VA_TEX0] != GX_DIRECT) {
+    if (portmaster_gx_debug_log_allowed() && vtxSize == 16) {
+      Log.info("PortMaster GX direct expand skipped: fmt={} vtxSize={} posDesc={} tex0Desc={} nrmDesc={} clr0Desc={}",
+               static_cast<u32>(fmt), vtxSize, static_cast<u32>(g_gxState.vtxDesc[GX_VA_POS]),
+               static_cast<u32>(g_gxState.vtxDesc[GX_VA_TEX0]), static_cast<u32>(g_gxState.vtxDesc[GX_VA_NRM]),
+               static_cast<u32>(g_gxState.vtxDesc[GX_VA_CLR0]));
+    }
+    return false;
+  }
+  return true;
+}
+
+static ByteBuffer expand_direct_pos_tex(GXVtxFmt fmt, const u8* data, u32 pos, u16 vtxCount) {
+  const auto& texFmt = g_gxState.vtxFmts[fmt].attrs[GX_VA_TEX0];
+  const float texScale = 1.0f / static_cast<float>(1u << texFmt.frac);
+  ByteBuffer expanded;
+  for (u16 v = 0; v < vtxCount; ++v) {
+    const auto* vtx = data + pos + v * 16;
+    const std::array position{
+        read_f32(vtx + 0, true),
+        read_f32(vtx + 4, true),
+        read_f32(vtx + 8, true),
+    };
+    constexpr std::array<u8, 4> white{255, 255, 255, 255};
+    const int16_t s = static_cast<int16_t>(read_u16(vtx + 12, true));
+    const int16_t t = static_cast<int16_t>(read_u16(vtx + 14, true));
+    const std::array tex{static_cast<float>(s) * texScale, static_cast<float>(t) * texScale};
+    expanded.append(position);
+    expanded.append(white);
+    expanded.append(tex);
+  }
+  return expanded;
+}
 
 // Draw command handler - parses vertices inline and caches results
 static ByteBuffer handle_draw_idx_buf;
@@ -1555,6 +1936,43 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (pos + totalVtxBytes > size) UNLIKELY {
     handle_draw_overrun(totalVtxBytes, data, pos, size);
+  }
+
+  if (portmaster_no_vertex_storage_mode() && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS) {
+    if (auto expanded = expand_portmaster_generic_draw(fmt, data, pos, vtxCount, vtxSize, bigEndian)) {
+      if (portmaster_gx_debug_log_allowed()) {
+        Log.info("PortMaster GX generic native expand draw: prim={} fmt={} vtxCount={} fifoStride={} nativeStride={} bytes={}",
+                 static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize, expanded->shaderConfig.vtxStride,
+                 expanded->vertices.size());
+      }
+      pos += totalVtxBytes;
+      const gfx::Range vertRange = gfx::push_verts(expanded->vertices.data(), expanded->vertices.size());
+      handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, &expanded->shaderConfig);
+      return;
+    }
+  }
+
+  if (can_expand_index16_pos_color(fmt, vtxSize)) {
+    if (portmaster_gx_debug_log_allowed()) {
+      Log.info("PortMaster GX expand INDEX16 draw: prim={} fmt={} vtxCount={} fifoStride={}", static_cast<u32>(prim),
+               static_cast<u32>(fmt), vtxCount, vtxSize);
+    }
+    auto expanded = expand_index16_pos_color(data, pos, vtxCount, vtxSize, bigEndian);
+    pos += totalVtxBytes;
+    const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
+    return;
+  }
+  if (can_expand_direct_pos_tex(fmt, vtxSize)) {
+    if (portmaster_gx_debug_log_allowed()) {
+      Log.info("PortMaster GX expand DIRECT POS+TEX0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
+               static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
+    }
+    auto expanded = expand_direct_pos_tex(fmt, data, pos, vtxCount);
+    pos += totalVtxBytes;
+    const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
+    return;
   }
 
   // Push raw vertex data to buffer
@@ -1590,7 +2008,8 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
 static ByteBuffer handle_draw_unmerged_idxBuf;
 
-static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange) {
+static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
+                                 bool forceNativePosColor, const ShaderConfig* forcedNativeShaderConfig) {
   ZoneScoped;
   u32 numIndices = 0;
   gfx::Range idxRange;
@@ -1621,6 +2040,71 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
 
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt);
+  if (forcedNativeShaderConfig != nullptr) {
+    config.shaderConfig.attrs = forcedNativeShaderConfig->attrs;
+    config.shaderConfig.vtxStride = forcedNativeShaderConfig->vtxStride;
+    config.shaderConfig.nativeVertexFetch = true;
+    config.shaderConfig.lineMode = 0;
+  } else if (forceNativePosColor) {
+    for (auto& attr : config.shaderConfig.attrs) {
+      attr = {};
+    }
+    config.shaderConfig.attrs[GX_VA_POS] = AttrConfig{
+        .attrType = GX_DIRECT,
+        .cnt = 3,
+        .compType = GX_F32,
+        .offset = 0,
+        .le = false,
+    };
+    config.shaderConfig.attrs[GX_VA_CLR0] = AttrConfig{
+        .attrType = GX_DIRECT,
+        .cnt = 1,
+        .compType = GX_RGBA8,
+        .offset = 12,
+        .le = false,
+    };
+    const auto expandedStride = vertRange.size / vtxCount;
+    if (expandedStride == 36) {
+      config.shaderConfig.attrs[GX_VA_NRM] = AttrConfig{
+          .attrType = GX_DIRECT,
+          .cnt = 3,
+          .compType = GX_F32,
+          .offset = 12,
+          .le = false,
+      };
+      config.shaderConfig.attrs[GX_VA_CLR0] = AttrConfig{
+          .attrType = GX_DIRECT,
+          .cnt = 1,
+          .compType = GX_RGBA8,
+          .offset = 24,
+          .le = false,
+      };
+      config.shaderConfig.attrs[GX_VA_TEX0] = AttrConfig{
+          .attrType = GX_DIRECT,
+          .cnt = 2,
+          .compType = GX_F32,
+          .offset = 28,
+          .le = false,
+      };
+      config.shaderConfig.vtxStride = 36;
+    } else if (expandedStride == 24) {
+      config.shaderConfig.attrs[GX_VA_TEX0] = AttrConfig{
+          .attrType = GX_DIRECT,
+          .cnt = 2,
+          .compType = GX_F32,
+          .offset = 16,
+          .le = false,
+      };
+      config.shaderConfig.vtxStride = 24;
+    } else {
+      config.shaderConfig.vtxStride = 16;
+    }
+    config.shaderConfig.nativeVertexFetch = true;
+    if (portmaster_gx_debug_log_allowed()) {
+      Log.info("PortMaster GX native vertex pipeline: stride={} vtxCount={} vertRangeSize={}",
+               config.shaderConfig.vtxStride, vtxCount, vertRange.size);
+    }
+  }
   const auto info = build_shader_info(config.shaderConfig);
   resolve_sampled_textures(info);
   const auto bindGroups = build_bind_groups(info);
@@ -1644,6 +2128,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       .instanceCount = instanceCount,
       .bindGroups = bindGroups,
       .dstAlpha = g_gxState.dstAlpha,
+      .nativeVertexFetch = config.shaderConfig.nativeVertexFetch != 0,
   });
 }
 

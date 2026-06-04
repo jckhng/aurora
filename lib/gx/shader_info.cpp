@@ -295,7 +295,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       continue;
     }
     const auto& tcg = config.tcgs[i];
-    if (tcg.postMtx != GX_PTIDENTITY) {
+    if (tcg.postMtx >= GX_PTTEXMTX0 && tcg.postMtx <= GX_PTTEXMTX19) {
       u32 postMtxIdx = (tcg.postMtx - GX_PTTEXMTX0) / 3;
       info.usesPTTexMtx.set(postMtxIdx);
     }

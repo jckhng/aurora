@@ -447,7 +447,8 @@ struct ShaderConfig {
   u8 fogType = GX_FOG_NONE;
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
-  u8 pad1 : 6 = 0;
+  u8 nativeVertexFetch : 1 = 0;
+  u8 pad1 : 5 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
@@ -490,6 +491,7 @@ struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
+bool can_use_native_vertex_fetch(const ShaderConfig& config) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;

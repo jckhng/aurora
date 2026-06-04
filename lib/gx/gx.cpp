@@ -750,6 +750,50 @@ u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept {
   Log.fatal("comp_cnt_count: Unsupported attr/cnt {} {}", attr, cnt);
 }
 
+bool can_use_native_vertex_fetch(const ShaderConfig& config) noexcept {
+  if (config.lineMode != 0 ||
+      (config.vtxStride != 12 && config.vtxStride != 16 && config.vtxStride != 24 && config.vtxStride != 36)) {
+    return false;
+  }
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto& mapping = config.attrs[i];
+    if (mapping.attrType == GX_NONE) {
+      continue;
+    }
+    if (mapping.attrType != GX_DIRECT) {
+      return false;
+    }
+    switch (attr) {
+    case GX_VA_POS:
+      if (mapping.cnt != 3 || mapping.compType != GX_F32 || mapping.offset != 0) {
+        return false;
+      }
+      break;
+    case GX_VA_NRM:
+      if (config.vtxStride != 36 || mapping.cnt != 3 || mapping.compType != GX_F32 || mapping.offset != 12) {
+        return false;
+      }
+      break;
+    case GX_VA_CLR0:
+      if ((config.vtxStride != 16 && config.vtxStride != 24 && config.vtxStride != 36) || mapping.cnt != 1 ||
+          mapping.compType != GX_RGBA8 || mapping.offset != (config.vtxStride == 36 ? 24 : 12)) {
+        return false;
+      }
+      break;
+    case GX_VA_TEX0:
+      if ((config.vtxStride != 24 && config.vtxStride != 36) || mapping.cnt != 2 || mapping.compType != GX_F32 ||
+          mapping.offset != (config.vtxStride == 36 ? 28 : 16)) {
+        return false;
+      }
+      break;
+    default:
+      return false;
+    }
+  }
+  return config.attrs[GX_VA_POS].attrType == GX_DIRECT;
+}
+
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ZoneScoped;
 
@@ -804,6 +848,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   } else {
     config.shaderConfig.lineMode = 0;
   }
+  config.shaderConfig.nativeVertexFetch = can_use_native_vertex_fetch(config.shaderConfig);
   config.shaderConfig.tevSwapTable = g_gxState.tevSwapTable;
   for (u8 i = 0; i < g_gxState.numTevStages; ++i) {
     config.shaderConfig.tevStages[i] = g_gxState.tevStages[i];

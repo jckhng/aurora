@@ -9,6 +9,7 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <absl/container/flat_hash_set.h>
+#include <cstdlib>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -23,6 +24,11 @@ using namespace std::string_view_literals;
 static Module Log("aurora::gfx::gx");
 
 absl::flat_hash_set<gfx::ShaderRef> g_seenShaders;
+
+static bool portmaster_gx_debug_enabled() noexcept {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_GX_DEBUG");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 static inline std::string_view chan_comp(GXTevColorChan chan) noexcept {
   switch (chan) {
@@ -634,6 +640,9 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   if (mapping.attrType == GX_NONE) {
     return vtx_attr(config, attr);
   }
+  if (config.nativeVertexFetch && mapping.attrType == GX_DIRECT) {
+    return std::string{vtx_attr(config, attr)};
+  }
   auto buf = "vbuf"sv;
   auto offs = fmt::format("ubuf.vtx_start + {} * {}u + {}u", vidx, config.vtxStride, mapping.offset);
   auto le = false; // Vertex buffer is always big endian (for now)
@@ -787,7 +796,8 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   ZoneScoped;
   const auto hash = xxh3_hash(config);
   const auto info = build_shader_info(config);
-  if (EnableDebugPrints && !g_seenShaders.contains(hash)) {
+  const bool debugPrints = EnableDebugPrints || portmaster_gx_debug_enabled();
+  if (debugPrints && !g_seenShaders.contains(hash)) {
     g_seenShaders.insert(hash);
 
     Log.info("Shader config (hash {:x}):", hash);
@@ -863,6 +873,27 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
   std::string vtxXfrAttrs;
   size_t vtxOutIdx = 0;
 
+  if (config.nativeVertexFetch) {
+    uint32_t location = 0;
+    const auto addNativeInput = [&](GXAttr attr, std::string_view type) {
+      if (config.attrs[attr].attrType == GX_NONE) {
+        return;
+      }
+      vtxInAttrs += fmt::format(",\n    @location({}) {}: {}", location++, vtx_attr(config, attr), type);
+    };
+    addNativeInput(GX_VA_PNMTXIDX, "u32"sv);
+    for (GXAttr attr = GX_VA_TEX0MTXIDX; attr <= GX_VA_TEX7MTXIDX; attr = static_cast<GXAttr>(attr + 1)) {
+      addNativeInput(attr, "u32"sv);
+    }
+    addNativeInput(GX_VA_POS, "vec3f"sv);
+    addNativeInput(GX_VA_NRM, "vec3f"sv);
+    addNativeInput(GX_VA_CLR0, "vec4f"sv);
+    addNativeInput(GX_VA_CLR1, "vec4f"sv);
+    for (GXAttr attr = GX_VA_TEX0; attr <= GX_VA_TEX7; attr = static_cast<GXAttr>(attr + 1)) {
+      addNativeInput(attr, "vec2f"sv);
+    }
+  }
+
   // Load points for line/point expansion
   std::string_view vidxAttr = "vidx"sv;
   if (config.lineMode != 0) {
@@ -913,6 +944,9 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     }
     // in_pnmtxidx and in_pos written above for line mode
     if ((attr != GX_VA_PNMTXIDX && attr != GX_VA_POS) || config.lineMode == 0) {
+      if (config.nativeVertexFetch && attr_load(config, attr, vidxAttr) == vtx_attr(config, attr)) {
+        continue;
+      }
       vtxXfrAttrsPre += fmt::format("\n    let {} = {};", vtx_attr(config, attr), attr_load(config, attr, vidxAttr));
     }
   }
@@ -1478,7 +1512,14 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
 
-  const auto shaderSource = fmt::format(R"""(
+  const auto staticBindings = config.nativeVertexFetch ? ""s : R"""(
+@group(0) @binding(0)
+var<storage, read> vbuf: array<u32>;
+@group(0) @binding(1)
+var<storage, read> abuf: array<u32>;
+)"""s;
+
+  const auto storageFetchPrelude = config.nativeVertexFetch ? ""s : R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -1789,7 +1830,10 @@ fn fetch_rgba8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
   let v = raw_fetch_u8_4(p, byte_off);
   return vec4f(v) / 255.0;
 }}
+)"""s;
 
+  const auto shaderSource = fmt::format(R"""(
+{10}
 fn tev_overflow_f32(in: f32) -> f32 {{
   let byte_space = in * 255.0;
   return (byte_space - floor(byte_space / 256.0) * 256.0) / 255.0;
@@ -1815,10 +1859,7 @@ struct Uniform {{
     pad: vec2u,
     array_start: array<u32, 12>,{0}
 }};
-@group(0) @binding(0)
-var<storage, read> vbuf: array<u32>;
-@group(0) @binding(1)
-var<storage, read> abuf: array<u32>;
+{9}
 @group(1) @binding(0)
 var<uniform> ubuf: Uniform;{1}
 
@@ -1840,8 +1881,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
 }}
 )""",
                                         uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
-                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre);
-  if (EnableDebugPrints) {
+                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre, staticBindings, storageFetchPrelude);
+  if (debugPrints) {
     Log.info("Generated shader: {}", shaderSource);
   }
 

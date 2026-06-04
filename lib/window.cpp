@@ -273,7 +273,9 @@ bool create_window(AuroraBackend backend) {
 #ifdef DAWN_ENABLE_BACKEND_OPENGL
   case BACKEND_OPENGL:
   case BACKEND_OPENGLES:
-    flags |= SDL_WINDOW_OPENGL;
+    if (SDL_getenv("DUSKLIGHT_PORTMASTER_X11_DAWN") == nullptr) {
+      flags |= SDL_WINDOW_OPENGL;
+    }
     break;
 #endif
 #endif
