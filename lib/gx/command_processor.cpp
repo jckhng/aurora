@@ -37,6 +37,11 @@ static bool portmaster_gx_debug_log_allowed() {
   return true;
 }
 
+static bool portmaster_gx_stats_enabled() {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_GX_STATS");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) {
   u16 numIndices = 0;
   if (prim == GX_QUADS) {
@@ -1557,6 +1562,13 @@ struct CpuExpandedDraw {
   ShaderConfig shaderConfig;
 };
 
+enum class PortmasterExpandPath : u8 {
+  Generic,
+  Index16PosColor,
+  DirectPosTex0,
+  DirectPosClr0,
+};
+
 static bool portmaster_no_vertex_storage_mode() {
   return std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr ||
          std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr;
@@ -1576,6 +1588,133 @@ static u8 canonical_attr_size(GXAttr attr) {
     return 8;
   }
   return 0;
+}
+
+static u64 portmaster_layout_desc_key() {
+  u64 key = 0;
+  u8 shift = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    key |= static_cast<u64>(g_gxState.vtxDesc[i] & 0x3) << shift;
+    shift += 2;
+  }
+  return key;
+}
+
+struct PortmasterLayoutStats {
+  u64 descKey = 0;
+  u32 prim = 0;
+  u32 fmt = 0;
+  u32 fifoStride = 0;
+  u64 draws = 0;
+  u64 vertices = 0;
+  u64 fifoBytes = 0;
+  u64 nativeBytes = 0;
+  u64 generic = 0;
+  u64 index16PosColor = 0;
+  u64 directPosTex0 = 0;
+  u64 directPosClr0 = 0;
+};
+
+static std::array<PortmasterLayoutStats, 64> s_portmasterLayoutStats{};
+static u64 s_portmasterLayoutStatDraws = 0;
+
+static const char* portmaster_expand_path_name(PortmasterExpandPath path) {
+  switch (path) {
+  case PortmasterExpandPath::Generic:
+    return "generic";
+  case PortmasterExpandPath::Index16PosColor:
+    return "index16-pos-color";
+  case PortmasterExpandPath::DirectPosTex0:
+    return "direct-pos-tex0";
+  case PortmasterExpandPath::DirectPosClr0:
+    return "direct-pos-clr0";
+  }
+  return "unknown";
+}
+
+static void portmaster_note_layout_stat(GXPrimitive prim, GXVtxFmt fmt, u32 fifoStride, u16 vtxCount, size_t nativeBytes,
+                                        PortmasterExpandPath path) {
+  if (!portmaster_gx_stats_enabled()) {
+    return;
+  }
+
+  const u64 descKey = portmaster_layout_desc_key();
+  PortmasterLayoutStats* slot = nullptr;
+  PortmasterLayoutStats* smallest = &s_portmasterLayoutStats[0];
+  for (auto& stat : s_portmasterLayoutStats) {
+    if (stat.draws == 0) {
+      slot = &stat;
+      break;
+    }
+    if (stat.descKey == descKey && stat.prim == static_cast<u32>(prim) && stat.fmt == static_cast<u32>(fmt) &&
+        stat.fifoStride == fifoStride) {
+      slot = &stat;
+      break;
+    }
+    if (stat.nativeBytes < smallest->nativeBytes) {
+      smallest = &stat;
+    }
+  }
+  if (slot == nullptr) {
+    slot = smallest;
+    *slot = {};
+  }
+  if (slot->draws == 0) {
+    slot->descKey = descKey;
+    slot->prim = static_cast<u32>(prim);
+    slot->fmt = static_cast<u32>(fmt);
+    slot->fifoStride = fifoStride;
+  }
+
+  ++slot->draws;
+  slot->vertices += vtxCount;
+  slot->fifoBytes += static_cast<u64>(fifoStride) * vtxCount;
+  slot->nativeBytes += nativeBytes;
+  switch (path) {
+  case PortmasterExpandPath::Generic:
+    ++slot->generic;
+    break;
+  case PortmasterExpandPath::Index16PosColor:
+    ++slot->index16PosColor;
+    break;
+  case PortmasterExpandPath::DirectPosTex0:
+    ++slot->directPosTex0;
+    break;
+  case PortmasterExpandPath::DirectPosClr0:
+    ++slot->directPosClr0;
+    break;
+  }
+
+  ++s_portmasterLayoutStatDraws;
+  if ((s_portmasterLayoutStatDraws & 0x7ff) != 0) {
+    return;
+  }
+
+  std::array<const PortmasterLayoutStats*, 5> top{};
+  for (const auto& stat : s_portmasterLayoutStats) {
+    if (stat.draws == 0) {
+      continue;
+    }
+    for (auto& topSlot : top) {
+      if (topSlot == nullptr || stat.nativeBytes > topSlot->nativeBytes) {
+        for (auto* move = &top.back(); move != &topSlot; --move) {
+          *move = *(move - 1);
+        }
+        topSlot = &stat;
+        break;
+      }
+    }
+  }
+
+  Log.info("PortMaster GX layout stats after {} expanded draws:", s_portmasterLayoutStatDraws);
+  for (const auto* stat : top) {
+    if (stat == nullptr) {
+      continue;
+    }
+    Log.info("  prim={} fmt={} fifoStride={} desc=0x{:011x} draws={} vertices={} fifoBytes={} nativeBytes={} paths[g={},i16={},pt={},pc={}]",
+             stat->prim, stat->fmt, stat->fifoStride, stat->descKey, stat->draws, stat->vertices, stat->fifoBytes,
+             stat->nativeBytes, stat->generic, stat->index16PosColor, stat->directPosTex0, stat->directPosClr0);
+  }
 }
 
 static void append_f32_attr(ByteBuffer& out, const std::array<float, 4>& values, u8 count) {
@@ -1735,6 +1874,7 @@ static std::optional<CpuExpandedDraw> expand_portmaster_generic_draw(GXVtxFmt fm
   if (!build_portmaster_native_shader_config(fmt, expanded.shaderConfig)) {
     return std::nullopt;
   }
+  expanded.vertices.reserve_extra(static_cast<size_t>(vtxCount) * expanded.shaderConfig.vtxStride);
 
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   for (u16 v = 0; v < vtxCount; ++v) {
@@ -1767,6 +1907,46 @@ static std::optional<CpuExpandedDraw> expand_portmaster_generic_draw(GXVtxFmt fm
       append_portmaster_native_attr(expanded.vertices, attr, attrSrc, attrFmt, attrBigEndian);
       srcOffset += consumedSize;
     }
+  }
+  return expanded;
+}
+
+static bool can_expand_direct_pos_color(GXVtxFmt fmt, u32 vtxSize) {
+  if (vtxSize != 16 || g_gxState.vtxDesc[GX_VA_POS] != GX_DIRECT || g_gxState.vtxDesc[GX_VA_CLR0] != GX_DIRECT) {
+    return false;
+  }
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    if (i == GX_VA_POS || i == GX_VA_CLR0) {
+      continue;
+    }
+    if (g_gxState.vtxDesc[i] != GX_NONE) {
+      return false;
+    }
+  }
+
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  const auto& posFmt = vtxFmt.attrs[GX_VA_POS];
+  const auto& clrFmt = vtxFmt.attrs[GX_VA_CLR0];
+  const bool posMatches = comp_cnt_count(GX_VA_POS, posFmt.cnt) == 3 && posFmt.type == GX_F32;
+  const bool clrMatches = comp_cnt_count(GX_VA_CLR0, clrFmt.cnt) == 1 &&
+                          (clrFmt.type == GX_RGBA8 || clrFmt.type == GX_RGBX8);
+  return posMatches && clrMatches;
+}
+
+static ByteBuffer expand_direct_pos_color(GXVtxFmt fmt, const u8* data, u32 pos, u16 vtxCount, bool bigEndian) {
+  const auto& clrFmt = g_gxState.vtxFmts[fmt].attrs[GX_VA_CLR0];
+  ByteBuffer expanded;
+  expanded.reserve_extra(static_cast<size_t>(vtxCount) * 16);
+  for (u16 v = 0; v < vtxCount; ++v) {
+    const auto* vtx = data + pos + v * 16;
+    const std::array position{
+        read_f32(vtx + 0, bigEndian),
+        read_f32(vtx + 4, bigEndian),
+        read_f32(vtx + 8, bigEndian),
+    };
+    const auto color = read_color_as_rgba8(vtx + 12, clrFmt.type, bigEndian);
+    expanded.append(position);
+    expanded.append(color);
   }
   return expanded;
 }
@@ -1831,6 +2011,7 @@ static ByteBuffer expand_index16_pos_color(const u8* data, u32 pos, u16 vtxCount
   const float nrmScale = hasNrm ? 1.0f / static_cast<float>(1u << nrmFmt.frac) : 1.0f;
   const float texScale = hasTex ? 1.0f / static_cast<float>(1u << texFmt.frac) : 1.0f;
   ByteBuffer expanded;
+  expanded.reserve_extra(static_cast<size_t>(vtxCount) * (hasNrm ? 36 : (hasTex ? 24 : 16)));
   for (u16 v = 0; v < vtxCount; ++v) {
     const auto* indexData = data + pos + v * vtxSize;
     const u16 posIdx = read_u16(indexData, bigEndian);
@@ -1888,23 +2069,39 @@ static bool can_expand_direct_pos_tex(GXVtxFmt fmt, u32 vtxSize) {
     }
     return false;
   }
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    if (i == GX_VA_POS || i == GX_VA_TEX0) {
+      continue;
+    }
+    if (g_gxState.vtxDesc[i] != GX_NONE) {
+      return false;
+    }
+  }
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  const auto& posFmt = vtxFmt.attrs[GX_VA_POS];
+  const auto& texFmt = vtxFmt.attrs[GX_VA_TEX0];
+  if (comp_cnt_count(GX_VA_POS, posFmt.cnt) != 3 || posFmt.type != GX_F32 ||
+      comp_cnt_count(GX_VA_TEX0, texFmt.cnt) != 2 || texFmt.type != GX_S16) {
+    return false;
+  }
   return true;
 }
 
-static ByteBuffer expand_direct_pos_tex(GXVtxFmt fmt, const u8* data, u32 pos, u16 vtxCount) {
+static ByteBuffer expand_direct_pos_tex(GXVtxFmt fmt, const u8* data, u32 pos, u16 vtxCount, bool bigEndian) {
   const auto& texFmt = g_gxState.vtxFmts[fmt].attrs[GX_VA_TEX0];
   const float texScale = 1.0f / static_cast<float>(1u << texFmt.frac);
   ByteBuffer expanded;
+  expanded.reserve_extra(static_cast<size_t>(vtxCount) * 24);
   for (u16 v = 0; v < vtxCount; ++v) {
     const auto* vtx = data + pos + v * 16;
     const std::array position{
-        read_f32(vtx + 0, true),
-        read_f32(vtx + 4, true),
-        read_f32(vtx + 8, true),
+        read_f32(vtx + 0, bigEndian),
+        read_f32(vtx + 4, bigEndian),
+        read_f32(vtx + 8, bigEndian),
     };
     constexpr std::array<u8, 4> white{255, 255, 255, 255};
-    const int16_t s = static_cast<int16_t>(read_u16(vtx + 12, true));
-    const int16_t t = static_cast<int16_t>(read_u16(vtx + 14, true));
+    const int16_t s = static_cast<int16_t>(read_u16(vtx + 12, bigEndian));
+    const int16_t t = static_cast<int16_t>(read_u16(vtx + 14, bigEndian));
     const std::array tex{static_cast<float>(s) * texScale, static_cast<float>(t) * texScale};
     expanded.append(position);
     expanded.append(white);
@@ -1938,13 +2135,53 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     handle_draw_overrun(totalVtxBytes, data, pos, size);
   }
 
-  if (portmaster_no_vertex_storage_mode() && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS) {
+  const bool portmasterNoVertexStorage =
+      portmaster_no_vertex_storage_mode() && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
+  if (portmasterNoVertexStorage && can_expand_index16_pos_color(fmt, vtxSize)) {
+    if (portmaster_gx_debug_log_allowed()) {
+      Log.info("PortMaster GX expand INDEX16 draw: prim={} fmt={} vtxCount={} fifoStride={}", static_cast<u32>(prim),
+               static_cast<u32>(fmt), vtxCount, vtxSize);
+    }
+    auto expanded = expand_index16_pos_color(data, pos, vtxCount, vtxSize, bigEndian);
+    portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded.size(), PortmasterExpandPath::Index16PosColor);
+    pos += totalVtxBytes;
+    const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
+    return;
+  }
+  if (portmasterNoVertexStorage && can_expand_direct_pos_tex(fmt, vtxSize)) {
+    if (portmaster_gx_debug_log_allowed()) {
+      Log.info("PortMaster GX expand DIRECT POS+TEX0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
+               static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
+    }
+    auto expanded = expand_direct_pos_tex(fmt, data, pos, vtxCount, bigEndian);
+    portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded.size(), PortmasterExpandPath::DirectPosTex0);
+    pos += totalVtxBytes;
+    const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
+    return;
+  }
+  if (portmasterNoVertexStorage && can_expand_direct_pos_color(fmt, vtxSize)) {
+    if (portmaster_gx_debug_log_allowed()) {
+      Log.info("PortMaster GX expand DIRECT POS+CLR0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
+               static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
+    }
+    auto expanded = expand_direct_pos_color(fmt, data, pos, vtxCount, bigEndian);
+    portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded.size(), PortmasterExpandPath::DirectPosClr0);
+    pos += totalVtxBytes;
+    const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
+    return;
+  }
+
+  if (portmasterNoVertexStorage) {
     if (auto expanded = expand_portmaster_generic_draw(fmt, data, pos, vtxCount, vtxSize, bigEndian)) {
       if (portmaster_gx_debug_log_allowed()) {
         Log.info("PortMaster GX generic native expand draw: prim={} fmt={} vtxCount={} fifoStride={} nativeStride={} bytes={}",
                  static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize, expanded->shaderConfig.vtxStride,
                  expanded->vertices.size());
       }
+      portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded->vertices.size(), PortmasterExpandPath::Generic);
       pos += totalVtxBytes;
       const gfx::Range vertRange = gfx::push_verts(expanded->vertices.data(), expanded->vertices.size());
       handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, &expanded->shaderConfig);
@@ -1968,7 +2205,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       Log.info("PortMaster GX expand DIRECT POS+TEX0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
                static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
     }
-    auto expanded = expand_direct_pos_tex(fmt, data, pos, vtxCount);
+    auto expanded = expand_direct_pos_tex(fmt, data, pos, vtxCount, bigEndian);
     pos += totalVtxBytes;
     const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
     handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
