@@ -186,6 +186,8 @@ extern wgpu::Buffer g_indexBuffer;
 extern wgpu::Buffer g_storageBuffer;
 extern wgpu::BindGroupLayout g_staticBindGroupLayout;
 extern wgpu::BindGroup g_staticBindGroup;
+extern wgpu::BindGroupLayout g_vertexTextureBindGroupLayout;
+extern wgpu::BindGroup g_vertexTextureBindGroup;
 extern wgpu::BindGroupLayout g_uniformBindGroupLayout;
 extern wgpu::BindGroup g_uniformBindGroup;
 

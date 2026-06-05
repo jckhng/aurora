@@ -28,7 +28,15 @@ extern "C" void Android_UnlockActivityMutex(void);
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <vector>
+
+#if defined(SDL_PLATFORM_LINUX)
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 #include "rmlui.hpp"
 #include "dolphin/vi/vi_internal.hpp"
@@ -79,6 +87,32 @@ Vec2<int> fit_frame_buffer_to_aspect(int width, int height, float aspect) {
   }
   return {width, std::max(1, static_cast<int>(std::lround(static_cast<float>(width) / aspect)))};
 }
+
+int positive_env_or(const char* name, int fallback) noexcept {
+  const char* value = SDL_getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+  return std::max(1, std::atoi(value));
+}
+
+#if defined(SDL_PLATFORM_LINUX)
+bool fbdev_physical_size(int& width, int& height) noexcept {
+  int fd = open("/dev/fb0", O_RDONLY, 0);
+  if (fd < 0) {
+    return false;
+  }
+  fb_var_screeninfo vinfo{};
+  const bool ok = ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0 && vinfo.xres > 0 && vinfo.yres > 0;
+  close(fd);
+  if (!ok) {
+    return false;
+  }
+  width = static_cast<int>(vinfo.xres);
+  height = static_cast<int>(vinfo.yres);
+  return true;
+}
+#endif
 
 void resize_swapchain() noexcept {
 #if defined(SDL_PLATFORM_ANDROID)
@@ -404,6 +438,12 @@ AuroraWindowSize get_window_size() {
   ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
          SDL_GetError());
 
+#if defined(SDL_PLATFORM_LINUX)
+  if (SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr) {
+    fbdev_physical_size(native_fb_w, native_fb_h);
+  }
+#endif
+
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
   if (g_frameBufferScale > 0.f) {
@@ -422,6 +462,12 @@ AuroraWindowSize get_window_size() {
       fb_w = fitW;
       fb_h = fitH;
     }
+  }
+  if (SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr) {
+    const int cappedW = positive_env_or("DUSKLIGHT_PORTMASTER_RENDER_WIDTH", fb_w);
+    const int cappedH = positive_env_or("DUSKLIGHT_PORTMASTER_RENDER_HEIGHT", fb_h);
+    fb_w = std::min(fb_w, cappedW);
+    fb_h = std::min(fb_h, cappedH);
   }
 
   const float scale = SDL_GetWindowDisplayScale(g_window);

@@ -3,8 +3,16 @@
 #include "../../gfx/depth_peek.hpp"
 
 #include <dolphin/gx/GXCpu2Efb.h>
+#include <cstdlib>
 
 void GXPeekZ(u16 x, u16 y, u32* z) {
+  if (std::getenv("DUSKLIGHT_PORTMASTER_DISABLE_DEPTH_PEEK") != nullptr) {
+    if (z != nullptr) {
+      *z = g_gxState.clearDepth & 0x00ffffffu;
+    }
+    return;
+  }
+
   aurora::gfx::depth_peek::poll();
 
   if (z != nullptr) {

@@ -30,6 +30,14 @@ static bool portmaster_gx_debug_enabled() noexcept {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static void replace_all(std::string& text, std::string_view from, std::string_view to) {
+  size_t pos = 0;
+  while ((pos = text.find(from, pos)) != std::string::npos) {
+    text.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+}
+
 static inline std::string_view chan_comp(GXTevColorChan chan) noexcept {
   switch (chan) {
   case GX_CH_RED:
@@ -584,52 +592,63 @@ auto fetch_fixed16_attr(std::string_view fetchFn, const AttrConfig& mapping, std
   // 3-component fixed-16 vertex attributes through reusable vector fetch helpers.
   // Emitting scalar component fetches at the call site avoids observed artifacts.
   if (mapping.cnt == 2) {
-    const auto comp0 = fmt::format("{}_1(&{}, {} + 0u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
-    const auto comp1 = fmt::format("{}_1(&{}, {} + 2u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
+    const auto comp0 = fmt::format("{}_1({}, {} + 0u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
+    const auto comp1 = fmt::format("{}_1({}, {} + 2u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
     return fmt::format("vec2f({}, {})", comp0, comp1);
   }
   if (mapping.cnt == 3) {
-    const auto comp0 = fmt::format("{}_1(&{}, {} + 0u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
-    const auto comp1 = fmt::format("{}_1(&{}, {} + 2u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
-    const auto comp2 = fmt::format("{}_1(&{}, {} + 4u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
+    const auto comp0 = fmt::format("{}_1({}, {} + 0u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
+    const auto comp1 = fmt::format("{}_1({}, {} + 2u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
+    const auto comp2 = fmt::format("{}_1({}, {} + 4u, {}u, {})", fetchFn, buf, offs, mapping.frac, le);
     return fmt::format("vec3f({}, {}, {})", comp0, comp1, comp2);
   }
-  return fmt::format("{}_{}(&{}, {}, {}u, {})", fetchFn, mapping.cnt, buf, offs, mapping.frac, le);
+  return fmt::format("{}_{}({}, {}, {}u, {})", fetchFn, mapping.cnt, buf, offs, mapping.frac, le);
 }
 
-auto fetch_attr(const AttrConfig& mapping, std::string_view buf, std::string_view offs, bool le) -> std::string {
+auto fetch_arg(std::string_view buf, bool textureVertexFetch) -> std::string {
+  if (textureVertexFetch) {
+    return std::string{buf};
+  }
+  return fmt::format("&{}", buf);
+}
+
+auto fetch_attr(const AttrConfig& mapping, std::string_view buf, std::string_view offs, bool le, bool textureVertexFetch)
+    -> std::string {
+  const auto arg = fetch_arg(buf, textureVertexFetch);
   switch (mapping.compType) {
   case GX_U8:
-    return fmt::format("fetch_u8_{}(&{}, {}, {}, {})", mapping.cnt, buf, offs, mapping.frac, le);
+    return fmt::format("fetch_u8_{}({}, {}, {}, {})", mapping.cnt, arg, offs, mapping.frac, le);
   case GX_S8:
-    return fmt::format("fetch_s8_{}(&{}, {}, {}, {})", mapping.cnt, buf, offs, mapping.frac, le);
+    return fmt::format("fetch_s8_{}({}, {}, {}, {})", mapping.cnt, arg, offs, mapping.frac, le);
   case GX_U16:
-    return fetch_fixed16_attr("fetch_u16"sv, mapping, buf, offs, le);
+    return fetch_fixed16_attr("fetch_u16"sv, mapping, arg, offs, le);
   case GX_S16:
-    return fetch_fixed16_attr("fetch_s16"sv, mapping, buf, offs, le);
+    return fetch_fixed16_attr("fetch_s16"sv, mapping, arg, offs, le);
   case GX_F32:
-    return fmt::format("fetch_f32_{}(&{}, {}, {})", mapping.cnt, buf, offs, le);
+    return fmt::format("fetch_f32_{}({}, {}, {})", mapping.cnt, arg, offs, le);
   case GX_RGBA8:
-    return fmt::format("unpack4x8unorm(load_u32_raw(&{}, {}))", buf, offs);
+    return fmt::format("unpack4x8unorm(load_u32_raw({}, {}))", arg, offs);
   default:
     Log.fatal("fetch_attr: Unimplemented {}", static_cast<GXCompType>(mapping.compType));
   }
 }
 
-auto fetch_color_attr(const AttrConfig& mapping, std::string_view buf, std::string_view offs, bool le) -> std::string {
+auto fetch_color_attr(const AttrConfig& mapping, std::string_view buf, std::string_view offs, bool le,
+                      bool textureVertexFetch) -> std::string {
+  const auto arg = fetch_arg(buf, textureVertexFetch);
   switch (mapping.compType) {
   case GX_RGB565:
-    return fmt::format("fetch_rgb565(&{}, {}, {})", buf, offs, le);
+    return fmt::format("fetch_rgb565({}, {}, {})", arg, offs, le);
   case GX_RGB8:
-    return fmt::format("fetch_rgb8(&{}, {}, {})", buf, offs, le);
+    return fmt::format("fetch_rgb8({}, {}, {})", arg, offs, le);
   case GX_RGBX8:
-    return fmt::format("fetch_rgbx8(&{}, {}, {})", buf, offs, le);
+    return fmt::format("fetch_rgbx8({}, {}, {})", arg, offs, le);
   case GX_RGBA4:
-    return fmt::format("fetch_rgba4(&{}, {}, {})", buf, offs, le);
+    return fmt::format("fetch_rgba4({}, {}, {})", arg, offs, le);
   case GX_RGBA6:
-    return fmt::format("fetch_rgba6(&{}, {}, {})", buf, offs, le);
+    return fmt::format("fetch_rgba6({}, {}, {})", arg, offs, le);
   case GX_RGBA8:
-    return fmt::format("fetch_rgba8(&{}, {}, {})", buf, offs, le);
+    return fmt::format("fetch_rgba8({}, {}, {})", arg, offs, le);
   default:
     Log.fatal("fetch_color_attr: Unimplemented {}", static_cast<GXCompType>(mapping.compType));
   }
@@ -644,22 +663,24 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
     return std::string{vtx_attr(config, attr)};
   }
   auto buf = "vbuf"sv;
+  const auto vbufArg = fetch_arg(buf, config.textureVertexFetch);
   auto offs = fmt::format("ubuf.vtx_start + {} * {}u + {}u", vidx, config.vtxStride, mapping.offset);
   auto le = false; // Vertex buffer is always big endian (for now)
   if (mapping.attrType == GX_INDEX8) {
-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1(&{}, {}) * {}u", attr - GX_VA_POS, buf, offs,
+    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1({}, {}) * {}u", attr - GX_VA_POS, vbufArg, offs,
                        mapping.stride);
     buf = "abuf"sv;
     le = mapping.le;
   } else if (mapping.attrType == GX_INDEX16) {
-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1(&{}, {}, {}) * {}u", attr - GX_VA_POS, buf, offs, le,
+    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1({}, {}, {}) * {}u", attr - GX_VA_POS, vbufArg, offs, le,
                        mapping.stride);
     buf = "abuf"sv;
     le = mapping.le;
   }
+  const auto arg = fetch_arg(buf, config.textureVertexFetch);
   switch (attr) {
   case GX_VA_PNMTXIDX:
-    return fmt::format("(raw_fetch_u8_1(&{}, {}) / 3u)", buf, offs);
+    return fmt::format("(raw_fetch_u8_1({}, {}) / 3u)", arg, offs);
   case GX_VA_TEX0MTXIDX:
   case GX_VA_TEX1MTXIDX:
   case GX_VA_TEX2MTXIDX:
@@ -668,9 +689,9 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   case GX_VA_TEX5MTXIDX:
   case GX_VA_TEX6MTXIDX:
   case GX_VA_TEX7MTXIDX:
-    return fmt::format("raw_fetch_u8_1(&{}, {})", buf, offs);
+    return fmt::format("raw_fetch_u8_1({}, {})", arg, offs);
   case GX_VA_POS: {
-    const auto posLoad = fetch_attr(mapping, buf, offs, le);
+    const auto posLoad = fetch_attr(mapping, buf, offs, le, config.textureVertexFetch);
     if (mapping.cnt == 2) {
       return fmt::format("vec3f({}, 0.0)", posLoad);
     }
@@ -678,10 +699,10 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   }
   case GX_VA_NRM:
     // TODO check for NBT/NBT3
-    return fetch_attr(mapping, buf, offs, le);
+    return fetch_attr(mapping, buf, offs, le, config.textureVertexFetch);
   case GX_VA_CLR0:
   case GX_VA_CLR1:
-    return fetch_color_attr(mapping, buf, offs, le);
+    return fetch_color_attr(mapping, buf, offs, le, config.textureVertexFetch);
   case GX_VA_TEX0:
   case GX_VA_TEX1:
   case GX_VA_TEX2:
@@ -690,7 +711,7 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   case GX_VA_TEX5:
   case GX_VA_TEX6:
   case GX_VA_TEX7: {
-    const auto texLoad = fetch_attr(mapping, buf, offs, le);
+    const auto texLoad = fetch_attr(mapping, buf, offs, le, config.textureVertexFetch);
     if (mapping.cnt == 1) {
       return fmt::format("vec2f({}, 0.0)", texLoad);
     }
@@ -1512,14 +1533,19 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
 
-  const auto staticBindings = config.nativeVertexFetch ? ""s : R"""(
+  const auto staticBindings = config.nativeVertexFetch ? ""s : config.textureVertexFetch ? R"""(
+@group(0) @binding(0)
+var vbuf: texture_2d<u32>;
+@group(0) @binding(1)
+var abuf: texture_2d<u32>;
+)"""s : R"""(
 @group(0) @binding(0)
 var<storage, read> vbuf: array<u32>;
 @group(0) @binding(1)
 var<storage, read> abuf: array<u32>;
 )"""s;
 
-  const auto storageFetchPrelude = config.nativeVertexFetch ? ""s : R"""(
+  auto storageFetchPrelude = config.nativeVertexFetch ? ""s : R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -1831,6 +1857,24 @@ fn fetch_rgba8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
   return vec4f(v) / 255.0;
 }}
 )"""s;
+
+  if (config.textureVertexFetch) {
+    replace_all(storageFetchPrelude, "ptr<storage, array<u32>>", "texture_2d<u32>");
+    replace_all(storageFetchPrelude,
+                R"""(fn load_word(p: texture_2d<u32>, word_idx: u32) -> u32 {{
+  // This guard is not expected to handle routine out-of-bounds accesses.
+  // It appears to discourage some Adreno drivers/optimizers from storage buffer
+  // optimizations that can cause visual artifacts, including vertex explosions
+  // in Dusklight.
+  if (word_idx < arrayLength(p)) {{
+    return p[word_idx];
+  }}
+  return 0u;
+}})""",
+                R"""(fn load_word(p: texture_2d<u32>, word_idx: u32) -> u32 {{
+  return textureLoad(p, vec2u(word_idx & 1023u, word_idx >> 10u), 0).r;
+}})""");
+  }
 
   const auto shaderSource = fmt::format(R"""(
 {10}

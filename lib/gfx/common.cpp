@@ -13,6 +13,8 @@
 #include "../window.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <optional>
 #include <ranges>
 
@@ -105,6 +107,12 @@ wgpu::Buffer g_vertexBuffer;
 wgpu::Buffer g_uniformBuffer;
 wgpu::Buffer g_indexBuffer;
 wgpu::Buffer g_storageBuffer;
+wgpu::BindGroupLayout g_vertexTextureBindGroupLayout;
+wgpu::BindGroup g_vertexTextureBindGroup;
+static wgpu::Texture g_vertexDataTexture;
+static wgpu::Texture g_storageDataTexture;
+static wgpu::TextureView g_vertexDataTextureView;
+static wgpu::TextureView g_storageDataTextureView;
 static std::array<wgpu::Buffer, 3> g_stagingBuffers;
 static size_t currentStagingBuffer = 0;
 enum class BufferMapState {
@@ -125,6 +133,63 @@ wgpu::BindGroup g_uniformBindGroup;
 AuroraStats g_stats{};
 uint32_t g_drawCallCount = 0;
 uint32_t g_mergedDrawCallCount = 0;
+
+constexpr uint32_t VertexDataTextureWidthWords = 1024;
+constexpr uint32_t VertexDataTextureBytesPerRow = VertexDataTextureWidthWords * sizeof(uint32_t);
+
+static uint32_t texture_height_for_bytes(uint64_t size) noexcept {
+  const uint64_t words = (size + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+  return std::max<uint32_t>(1u, static_cast<uint32_t>((words + VertexDataTextureWidthWords - 1u) / VertexDataTextureWidthWords));
+}
+
+using Clock = std::chrono::steady_clock;
+static Clock::time_point s_frameStart = Clock::now();
+static Clock::time_point s_timingIntervalStart = Clock::now();
+static uint64_t s_timingFrames = 0;
+static uint64_t s_timingFrameUs = 0;
+static uint64_t s_timingMaxFrameUs = 0;
+
+static bool portmaster_timing_enabled() noexcept {
+  const char* disabled = std::getenv("DUSKLIGHT_PORTMASTER_TIMING");
+  if (disabled != nullptr && disabled[0] == '0') {
+    return false;
+  }
+  return std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr;
+}
+
+static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSize, size_t storageWriteSize,
+                                         size_t indexWriteSize, uint32_t drawCount) noexcept {
+  if (!portmaster_timing_enabled()) {
+    return;
+  }
+  ++s_timingFrames;
+  s_timingFrameUs += frameUs;
+  s_timingMaxFrameUs = std::max(s_timingMaxFrameUs, frameUs);
+
+  const auto now = Clock::now();
+  const auto intervalMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_timingIntervalStart).count();
+  if (intervalMs < 5000) {
+    return;
+  }
+
+  const auto gxStats = gx::fifo::take_portmaster_timing_stats();
+  const double seconds = static_cast<double>(intervalMs) / 1000.0;
+  const double fps = seconds > 0.0 ? static_cast<double>(s_timingFrames) / seconds : 0.0;
+  const double avgFrameMs = s_timingFrames > 0 ? static_cast<double>(s_timingFrameUs) / static_cast<double>(s_timingFrames) / 1000.0 : 0.0;
+  const double maxFrameMs = static_cast<double>(s_timingMaxFrameUs) / 1000.0;
+  Log.info("PortMaster timing: fps={:.2f} frames={} avg_cpu_frame_ms={:.1f} max_cpu_frame_ms={:.1f} draws_last={} uploads[v={} i={} s={}] gx_draws[tex={} cpu={} native={} storage={}] gx_bytes[fifo={} native={}] gx_index[noidx={} idx={} avoided={} bytes={}]",
+           fps, s_timingFrames, avgFrameMs, maxFrameMs, drawCount, vertexWriteSize, indexWriteSize, storageWriteSize,
+           gxStats.textureVertexDraws, gxStats.cpuGenericDraws, gxStats.directNativeDraws, gxStats.storageVertexDraws,
+           gxStats.fifoBytes, gxStats.nativeBytes, gxStats.noIndexTriangleDraws, gxStats.indexedPrimitiveDraws,
+           gxStats.avoidedPrimitiveIndexBytes, gxStats.primitiveIndexBytes);
+
+  s_timingIntervalStart = now;
+  s_timingFrames = 0;
+  s_timingFrameUs = 0;
+  s_timingMaxFrameUs = 0;
+}
 
 using CommandList = std::vector<Command>;
 struct RenderPass {
@@ -550,6 +615,70 @@ void initialize() {
 
   {
     constexpr std::array layoutEntries{
+        wgpu::BindGroupLayoutEntry{
+            .binding = 0,
+            .visibility = wgpu::ShaderStage::Vertex,
+            .texture =
+                wgpu::TextureBindingLayout{
+                    .sampleType = wgpu::TextureSampleType::Uint,
+                    .viewDimension = wgpu::TextureViewDimension::e2D,
+                },
+        },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1,
+            .visibility = wgpu::ShaderStage::Vertex,
+            .texture =
+                wgpu::TextureBindingLayout{
+                    .sampleType = wgpu::TextureSampleType::Uint,
+                    .viewDimension = wgpu::TextureViewDimension::e2D,
+                },
+        },
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDesc{
+        .label = "Vertex texture bind group layout",
+        .entryCount = layoutEntries.size(),
+        .entries = layoutEntries.data(),
+    };
+    g_vertexTextureBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
+    const auto createTexture = [](uint64_t byteSize, const char* label) {
+      const wgpu::TextureDescriptor descriptor{
+          .label = label,
+          .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+          .size =
+              {
+                  .width = VertexDataTextureWidthWords,
+                  .height = texture_height_for_bytes(byteSize),
+                  .depthOrArrayLayers = 1,
+              },
+          .format = wgpu::TextureFormat::R32Uint,
+      };
+      return g_device.CreateTexture(&descriptor);
+    };
+    g_vertexDataTexture = createTexture(VertexBufferSize, "Shared vertex data texture");
+    g_storageDataTexture = createTexture(StorageBufferSize, "Shared storage data texture");
+    g_vertexDataTextureView = g_vertexDataTexture.CreateView();
+    g_storageDataTextureView = g_storageDataTexture.CreateView();
+    const std::array entries{
+        wgpu::BindGroupEntry{
+            .binding = 0,
+            .textureView = g_vertexDataTextureView,
+        },
+        wgpu::BindGroupEntry{
+            .binding = 1,
+            .textureView = g_storageDataTextureView,
+        },
+    };
+    const wgpu::BindGroupDescriptor bindGroupDescriptor{
+        .label = "Vertex texture bind group",
+        .layout = g_vertexTextureBindGroupLayout,
+        .entryCount = entries.size(),
+        .entries = entries.data(),
+    };
+    g_vertexTextureBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+  }
+
+  {
+    constexpr std::array layoutEntries{
         // Uniform buffer (dynamic offset)
         wgpu::BindGroupLayoutEntry{
             .binding = 0,
@@ -602,6 +731,12 @@ void shutdown() {
   g_uniformBuffer = {};
   g_indexBuffer = {};
   g_storageBuffer = {};
+  g_vertexTextureBindGroup = {};
+  g_vertexTextureBindGroupLayout = {};
+  g_vertexDataTexture = {};
+  g_storageDataTexture = {};
+  g_vertexDataTextureView = {};
+  g_storageDataTextureView = {};
   g_stagingBuffers.fill({});
   g_renderPasses.clear();
   g_currentRenderPass = UINT32_MAX;
@@ -641,6 +776,7 @@ void map_staging_buffer() {
 
 bool begin_frame() {
   ZoneScoped;
+  s_frameStart = Clock::now();
   {
     ZoneScopedN("Wait for buffer map");
     map_staging_buffer();
@@ -708,10 +844,39 @@ void end_frame(const wgpu::CommandEncoder& cmd) {
   s_mappingState.store(BufferMapState::Unmapped, std::memory_order_release);
   g_stats.drawCallCount = g_drawCallCount;
   g_stats.mergedDrawCallCount = g_mergedDrawCallCount;
+  const auto vertexWriteSize = g_verts.size();
+  const auto indexWriteSize = g_indices.size();
+  const auto storageWriteSize = g_storage.size();
   g_stats.lastVertSize = writeBuffer(g_verts, g_vertexBuffer, VertexBufferSize, "Vertex");
   g_stats.lastUniformSize = writeBuffer(g_uniforms, g_uniformBuffer, UniformBufferSize, "Uniform");
   g_stats.lastIndexSize = writeBuffer(g_indices, g_indexBuffer, IndexBufferSize, "Index");
   g_stats.lastStorageSize = writeBuffer(g_storage, g_storageBuffer, StorageBufferSize, "Storage");
+  const auto copyDataTexture = [&](wgpu::Texture& texture, uint64_t stagingOffset, uint64_t writeSize) {
+    if (!texture || writeSize == 0) {
+      return;
+    }
+    const uint32_t rows = texture_height_for_bytes(writeSize);
+    const wgpu::TexelCopyBufferInfo src{
+        .layout =
+            wgpu::TexelCopyBufferLayout{
+                .offset = stagingOffset,
+                .bytesPerRow = VertexDataTextureBytesPerRow,
+                .rowsPerImage = rows,
+            },
+        .buffer = g_stagingBuffers[currentStagingBuffer],
+    };
+    const wgpu::TexelCopyTextureInfo dst{
+        .texture = texture,
+    };
+    const wgpu::Extent3D size{
+        .width = VertexDataTextureWidthWords,
+        .height = rows,
+        .depthOrArrayLayers = 1,
+    };
+    cmd.CopyBufferToTexture(&src, &dst, &size);
+  };
+  copyDataTexture(g_vertexDataTexture, 0, vertexWriteSize);
+  copyDataTexture(g_storageDataTexture, VertexBufferSize + UniformBufferSize + IndexBufferSize, storageWriteSize);
   if constexpr (UseTextureBuffer) {
     g_stats.lastTextureUploadSize = g_textureUpload.size();
     {
@@ -740,6 +905,9 @@ void end_frame(const wgpu::CommandEncoder& cmd) {
   }
   end_pipeline_frame();
   ++g_frameIndex;
+  const auto frameUs = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - s_frameStart).count());
+  note_portmaster_frame_timing(frameUs, vertexWriteSize, storageWriteSize, indexWriteSize, g_drawCallCount);
 }
 
 uint32_t current_frame() noexcept { return g_frameIndex; }

@@ -69,14 +69,19 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   if (data.bindGroups.textureBindGroup) {
     pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
   }
+  pass.SetBindGroup(0, data.textureVertexFetch ? gfx::g_vertexTextureBindGroup : gfx::g_staticBindGroup);
   if (data.nativeVertexFetch) {
     pass.SetVertexBuffer(0, gfx::g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
   }
-  pass.SetIndexBuffer(gfx::g_indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
   if (data.dstAlpha != UINT32_MAX) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
   }
-  pass.DrawIndexed(data.indexCount, data.instanceCount);
+  if (data.idxRange.size == 0) {
+    pass.Draw(data.indexCount, data.instanceCount);
+  } else {
+    pass.SetIndexBuffer(gfx::g_indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+    pass.DrawIndexed(data.indexCount, data.instanceCount);
+  }
 }
 } // namespace aurora::gx

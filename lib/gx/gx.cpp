@@ -40,6 +40,7 @@ static absl::flat_hash_map<u32, std::pair<wgpu::BindGroupLayout, wgpu::BindGroup
 static wgpu::BindGroupLayout sTextureBindGroupLayout;
 static wgpu::BindGroupLayout sSamplerBindGroupLayout;
 static wgpu::PipelineLayout sPipelineLayout;
+static wgpu::PipelineLayout sTextureVertexPipelineLayout;
 wgpu::BindGroup g_emptyTextureBindGroup;
 
 namespace {
@@ -634,7 +635,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
   };
   const wgpu::RenderPipelineDescriptor descriptor{
       .label = label,
-      .layout = sPipelineLayout,
+      .layout = config.shaderConfig.textureVertexFetch ? sTextureVertexPipelineLayout : sPipelineLayout,
       .vertex =
           {
               .module = shader,
@@ -1005,12 +1006,27 @@ void initialize() noexcept {
     };
     sPipelineLayout = g_device.CreatePipelineLayout(&desc);
   }
+  {
+    const std::array layouts{
+        gfx::g_vertexTextureBindGroupLayout,
+        gfx::g_uniformBindGroupLayout,
+        sTextureBindGroupLayout,
+    };
+    const wgpu::PipelineLayoutDescriptor desc{
+        .label = "GX Texture Vertex Pipeline Layout",
+        .bindGroupLayoutCount = layouts.size(),
+        .bindGroupLayouts = layouts.data(),
+    };
+    sTextureVertexPipelineLayout = g_device.CreatePipelineLayout(&desc);
+  }
 }
 
 void shutdown() noexcept {
   // TODO we should probably store this all in g_state.gx instead
   sSamplerBindGroupLayout = {};
   sTextureBindGroupLayout = {};
+  sTextureVertexPipelineLayout = {};
+  sPipelineLayout = {};
   {
     std::lock_guard lock{sBindGroupLayoutMutex};
     sUniformBindGroupLayouts.clear();

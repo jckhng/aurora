@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,76 @@ char g_gameName[4];
 namespace {
 Module Log("aurora");
 
+using Clock = std::chrono::steady_clock;
+
+static bool portmaster_timing_enabled() noexcept {
+  const char* disabled = std::getenv("DUSKLIGHT_PORTMASTER_TIMING");
+  if (disabled != nullptr && disabled[0] == '0') {
+    return false;
+  }
+  return std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr;
+}
+
+static uint64_t elapsed_us(Clock::time_point start, Clock::time_point end = Clock::now()) noexcept {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+}
+
+#ifdef AURORA_ENABLE_GX
+struct PortmasterEndFrameTiming {
+  Clock::time_point intervalStart = Clock::now();
+  uint64_t frames = 0;
+  uint64_t drainUs = 0;
+  uint64_t gfxEndUs = 0;
+  uint64_t renderEncodeUs = 0;
+  uint64_t finishUs = 0;
+  uint64_t submitUs = 0;
+  uint64_t afterSubmitUs = 0;
+  uint64_t finishSubmitUs = 0;
+  uint64_t fbdevPresentUs = 0;
+  uint64_t totalUs = 0;
+  uint64_t maxTotalUs = 0;
+};
+
+static PortmasterEndFrameTiming s_portmasterEndFrameTiming{};
+
+static void note_portmaster_end_frame_timing(uint64_t drainUs, uint64_t gfxEndUs, uint64_t renderEncodeUs,
+                                             uint64_t finishUs, uint64_t submitUs, uint64_t afterSubmitUs,
+                                             uint64_t finishSubmitUs, uint64_t fbdevPresentUs,
+                                             uint64_t totalUs) noexcept {
+  if (!portmaster_timing_enabled()) {
+    return;
+  }
+  auto& t = s_portmasterEndFrameTiming;
+  ++t.frames;
+  t.drainUs += drainUs;
+  t.gfxEndUs += gfxEndUs;
+  t.renderEncodeUs += renderEncodeUs;
+  t.finishUs += finishUs;
+  t.submitUs += submitUs;
+  t.afterSubmitUs += afterSubmitUs;
+  t.finishSubmitUs += finishSubmitUs;
+  t.fbdevPresentUs += fbdevPresentUs;
+  t.totalUs += totalUs;
+  t.maxTotalUs = std::max(t.maxTotalUs, totalUs);
+  const auto now = Clock::now();
+  const auto intervalMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - t.intervalStart).count();
+  if (intervalMs < 5000) {
+    return;
+  }
+  const double frames = static_cast<double>(std::max<uint64_t>(1, t.frames));
+  Log.info("PortMaster end_frame timing: frames={} avg_total_ms={:.1f} max_total_ms={:.1f} avg_drain_ms={:.1f} avg_gfx_end_ms={:.1f} avg_render_encode_ms={:.1f} avg_finish_ms={:.1f} avg_submit_ms={:.1f} avg_after_submit_ms={:.1f} avg_finish_submit_ms={:.1f} avg_fbdev_present_ms={:.1f}",
+           t.frames, static_cast<double>(t.totalUs) / frames / 1000.0, static_cast<double>(t.maxTotalUs) / 1000.0,
+           static_cast<double>(t.drainUs) / frames / 1000.0, static_cast<double>(t.gfxEndUs) / frames / 1000.0,
+           static_cast<double>(t.renderEncodeUs) / frames / 1000.0, static_cast<double>(t.finishUs) / frames / 1000.0,
+           static_cast<double>(t.submitUs) / frames / 1000.0, static_cast<double>(t.afterSubmitUs) / frames / 1000.0,
+           static_cast<double>(t.finishSubmitUs) / frames / 1000.0,
+           static_cast<double>(t.fbdevPresentUs) / frames / 1000.0);
+  t = {};
+  t.intervalStart = now;
+}
+#endif
+
 #ifdef AURORA_ENABLE_GX
 // GPU
 using webgpu::g_device;
@@ -54,6 +125,7 @@ namespace portmaster_fbdev {
 struct State {
   bool initialized = false;
   bool available = false;
+  bool singlePage = false;
   int fd = -1;
   uint8_t* pixels = nullptr;
   size_t bytes = 0;
@@ -68,9 +140,62 @@ struct State {
 State g_state;
 std::atomic_bool g_mapDone = false;
 bool g_mapOk = false;
+static Clock::time_point s_fbdevIntervalStart = Clock::now();
+static uint64_t s_fbdevFrames = 0;
+static uint64_t s_fbdevWaitUs = 0;
+static uint64_t s_fbdevMapUs = 0;
+static uint64_t s_fbdevWriteUs = 0;
+static uint64_t s_fbdevMaxWaitUs = 0;
+
+void note_fbdev_timing(uint64_t mapUs, uint64_t waitUs, uint64_t writeUs) noexcept {
+  if (!portmaster_timing_enabled()) {
+    return;
+  }
+  ++s_fbdevFrames;
+  s_fbdevMapUs += mapUs;
+  s_fbdevWaitUs += waitUs;
+  s_fbdevWriteUs += writeUs;
+  s_fbdevMaxWaitUs = std::max(s_fbdevMaxWaitUs, waitUs);
+  const auto now = Clock::now();
+  const auto intervalMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_fbdevIntervalStart).count();
+  if (intervalMs < 5000) {
+    return;
+  }
+  const double frames = static_cast<double>(std::max<uint64_t>(1, s_fbdevFrames));
+  Log.info("PortMaster fbdev timing: frames={} avg_map_ms={:.1f} avg_wait_ms={:.1f} max_wait_ms={:.1f} avg_write_ms={:.1f}",
+           s_fbdevFrames, static_cast<double>(s_fbdevMapUs) / frames / 1000.0,
+           static_cast<double>(s_fbdevWaitUs) / frames / 1000.0, static_cast<double>(s_fbdevMaxWaitUs) / 1000.0,
+           static_cast<double>(s_fbdevWriteUs) / frames / 1000.0);
+  s_fbdevIntervalStart = now;
+  s_fbdevFrames = 0;
+  s_fbdevMapUs = 0;
+  s_fbdevWaitUs = 0;
+  s_fbdevWriteUs = 0;
+  s_fbdevMaxWaitUs = 0;
+}
 
 bool enabled() noexcept {
   return std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr;
+}
+
+uint32_t present_interval() noexcept {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_PRESENT_INTERVAL");
+  if (value == nullptr || value[0] == '\0') {
+    return 2;
+  }
+  const auto interval = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+  return std::max(1u, interval);
+}
+
+bool should_present_frame() noexcept {
+  if (!enabled()) {
+    return false;
+  }
+  static uint32_t frame = 0;
+  const uint32_t interval = present_interval();
+  const bool present = (frame % interval) == 0;
+  ++frame;
+  return present;
 }
 
 uint32_t align_to(uint32_t value, uint32_t alignment) noexcept {
@@ -94,6 +219,15 @@ bool initialize() noexcept {
     g_state.fd = -1;
     return false;
   }
+  if (g_state.var.yres_virtual >= g_state.var.yres) {
+    auto pan = g_state.var;
+    pan.xoffset = 0;
+    pan.yoffset = 0;
+    if (ioctl(g_state.fd, FBIOPAN_DISPLAY, &pan) == 0 && ioctl(g_state.fd, FBIOGET_VSCREENINFO, &g_state.var) == 0 &&
+        g_state.var.yoffset == 0) {
+      g_state.singlePage = true;
+    }
+  }
   const uint32_t virtualHeight = std::max(g_state.var.yres, g_state.var.yres_virtual);
   g_state.bytes = static_cast<size_t>(g_state.fix.line_length) * virtualHeight;
   g_state.pixels = static_cast<uint8_t*>(mmap(nullptr, g_state.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, g_state.fd, 0));
@@ -105,9 +239,9 @@ bool initialize() noexcept {
     return false;
   }
   g_state.available = true;
-  Log.warn("PortMaster fbdev presenter active: {}x{} virtual {}x{} {}bpp stride {}", g_state.var.xres,
-           g_state.var.yres, g_state.var.xres_virtual, g_state.var.yres_virtual, g_state.var.bits_per_pixel,
-           g_state.fix.line_length);
+  Log.warn("PortMaster fbdev presenter active: {}x{} virtual {}x{} offset {}x{} {}bpp stride {} pages {}",
+           g_state.var.xres, g_state.var.yres, g_state.var.xres_virtual, g_state.var.yres_virtual, g_state.var.xoffset,
+           g_state.var.yoffset, g_state.var.bits_per_pixel, g_state.fix.line_length, g_state.singlePage ? 1 : 2);
   return true;
 }
 
@@ -182,7 +316,22 @@ void write_fb(const uint8_t* src) noexcept {
     return;
   }
   const uint32_t virtualHeight = std::max(g_state.var.yres, g_state.var.yres_virtual);
-  const uint32_t pageCount = std::max(1u, virtualHeight / dstHeight);
+  const uint32_t pageCount = g_state.singlePage ? 1u : std::max(1u, virtualHeight / dstHeight);
+  if (bytesPerPixel == 4u && srcWidth == dstWidth && srcHeight == dstHeight) {
+    for (uint32_t page = 0; page < pageCount; ++page) {
+      uint8_t* dstPage = g_state.pixels + static_cast<size_t>(page * dstHeight) * g_state.fix.line_length;
+      for (uint32_t y = 0; y < dstHeight; ++y) {
+        const uint8_t* srcRow = src + static_cast<size_t>(y) * g_state.readbackStride;
+        auto* dstRow = reinterpret_cast<uint32_t*>(dstPage + static_cast<size_t>(y) * g_state.fix.line_length);
+        for (uint32_t x = 0; x < dstWidth; ++x) {
+          const uint8_t* p = srcRow + static_cast<size_t>(x) * 4u;
+          dstRow[x] = 0xff000000u | (static_cast<uint32_t>(p[0]) << 16u) | (static_cast<uint32_t>(p[1]) << 8u) |
+                      static_cast<uint32_t>(p[2]);
+        }
+      }
+    }
+    return;
+  }
   for (uint32_t y = 0; y < dstHeight; ++y) {
     const uint32_t sy = std::min(srcHeight - 1u, static_cast<uint32_t>((static_cast<uint64_t>(y) * srcHeight) / dstHeight));
     const uint8_t* srcRow = src + static_cast<size_t>(sy) * g_state.readbackStride;
@@ -217,6 +366,7 @@ void present_after_submit() {
   g_mapDone.store(false, std::memory_order_release);
   g_mapOk = false;
   const uint64_t byteSize = static_cast<uint64_t>(g_state.readbackStride) * g_state.readbackHeight;
+  const auto mapStart = Clock::now();
   const auto future = g_state.readback.MapAsync(
       wgpu::MapMode::Read, 0, byteSize, wgpu::CallbackMode::WaitAnyOnly,
       [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
@@ -226,13 +376,18 @@ void present_after_submit() {
         g_mapOk = status == wgpu::MapAsyncStatus::Success;
         g_mapDone.store(true, std::memory_order_release);
       });
+  const auto mapQueued = Clock::now();
   const auto status = webgpu::g_instance.WaitAny(future, 1000000000);
+  const auto waitDone = Clock::now();
   if (status != wgpu::WaitStatus::Success || !g_mapDone.load(std::memory_order_acquire) || !g_mapOk) {
     Log.warn("PortMaster fbdev readback wait failed: {}", magic_enum::enum_name(status));
     return;
   }
   const auto* data = static_cast<const uint8_t*>(g_state.readback.GetConstMappedRange(0, byteSize));
+  const auto writeStart = Clock::now();
   write_fb(data);
+  const auto writeDone = Clock::now();
+  note_fbdev_timing(elapsed_us(mapStart, mapQueued), elapsed_us(mapQueued, waitDone), elapsed_us(writeStart, writeDone));
   g_state.readback.Unmap();
 }
 } // namespace portmaster_fbdev
@@ -470,12 +625,19 @@ bool begin_frame() noexcept {
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
+  const bool fbdevPresentThisFrame = portmaster_fbdev::should_present_frame();
+  const auto frameStart = Clock::now();
+  const auto drainStart = frameStart;
   gx::fifo::drain();
+  const auto drainDone = Clock::now();
   const auto encoderDescriptor = wgpu::CommandEncoderDescriptor{
       .label = "Redraw encoder",
   };
   auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
+  const auto gfxEndStart = Clock::now();
   gfx::end_frame(encoder);
+  const auto gfxEndDone = Clock::now();
+  const auto renderStart = Clock::now();
   gfx::render(encoder);
   {
     window::SurfaceLock surfaceLock;
@@ -539,7 +701,7 @@ void end_frame() noexcept {
       Log.info("Skipping present; window not presentable");
       webgpu::release_surface();
     }
-    if (portmaster_fbdev::enabled()) {
+    if (fbdevPresentThisFrame) {
       const auto& presentSource = webgpu::present_source();
       const webgpu::TextureWithSampler* readbackSource = &presentSource;
     #if AURORA_ENABLE_RMLUI
@@ -555,11 +717,20 @@ void end_frame() noexcept {
     #endif
       portmaster_fbdev::enqueue_readback(encoder, *readbackSource);
     }
+    const auto renderDone = Clock::now();
+    const auto finishSubmitStart = Clock::now();
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
+    const auto finishDone = Clock::now();
     g_queue.Submit(1, &buffer);
+    const auto queueSubmitDone = Clock::now();
     gfx::after_submit();
-    portmaster_fbdev::present_after_submit();
+    const auto submitDone = Clock::now();
+    const auto fbdevStart = Clock::now();
+    if (fbdevPresentThisFrame) {
+      portmaster_fbdev::present_after_submit();
+    }
+    const auto fbdevDone = Clock::now();
     if (window::is_presentable() && g_surface) {
       auto presentStatus = g_surface.Present();
       if (presentStatus != wgpu::Status::Success) {
@@ -570,6 +741,11 @@ void end_frame() noexcept {
       webgpu::release_surface();
     }
     g_currentView = {};
+    note_portmaster_end_frame_timing(elapsed_us(drainStart, drainDone), elapsed_us(gfxEndStart, gfxEndDone),
+                                     elapsed_us(renderStart, renderDone), elapsed_us(finishSubmitStart, finishDone),
+                                     elapsed_us(finishDone, queueSubmitDone), elapsed_us(queueSubmitDone, submitDone),
+                                     elapsed_us(finishSubmitStart, submitDone),
+                                     elapsed_us(fbdevStart, fbdevDone), elapsed_us(frameStart, fbdevDone));
   }
 
   TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);

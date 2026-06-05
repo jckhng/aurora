@@ -448,7 +448,8 @@ struct ShaderConfig {
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
   u8 nativeVertexFetch : 1 = 0;
-  u8 pad1 : 5 = 0;
+  u8 textureVertexFetch : 1 = 0;
+  u8 pad1 : 4 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
@@ -490,6 +491,21 @@ struct ShaderInfo {
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
+
+struct PortmasterTimingStats {
+  u64 textureVertexDraws = 0;
+  u64 cpuGenericDraws = 0;
+  u64 directNativeDraws = 0;
+  u64 storageVertexDraws = 0;
+  u64 nativeVertexDraws = 0;
+  u64 fifoBytes = 0;
+  u64 nativeBytes = 0;
+  u64 noIndexTriangleDraws = 0;
+  u64 indexedPrimitiveDraws = 0;
+  u64 avoidedPrimitiveIndexBytes = 0;
+  u64 primitiveIndexBytes = 0;
+};
+
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
 bool can_use_native_vertex_fetch(const ShaderConfig& config) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
@@ -499,4 +515,8 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept;
+
+namespace fifo {
+PortmasterTimingStats take_portmaster_timing_stats() noexcept;
+}
 } // namespace aurora::gx

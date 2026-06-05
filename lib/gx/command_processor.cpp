@@ -1555,7 +1555,8 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
 }
 
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
-                                 bool forceNativePosColor = false, const ShaderConfig* forcedNativeShaderConfig = nullptr);
+                                 bool forceNativePosColor = false, const ShaderConfig* forcedNativeShaderConfig = nullptr,
+                                 bool forceTextureVertexFetch = false);
 
 struct CpuExpandedDraw {
   ByteBuffer vertices;
@@ -1567,11 +1568,19 @@ enum class PortmasterExpandPath : u8 {
   Index16PosColor,
   DirectPosTex0,
   DirectPosClr0,
+  TextureVertex,
+  StorageVertex,
 };
 
 static bool portmaster_no_vertex_storage_mode() {
   return std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr ||
-         std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr;
+         std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr;
+}
+
+static bool portmaster_texture_vertex_fetch_mode() {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_VERTEX_TEXTURE");
+  return value == nullptr || value[0] == '\0' || value[0] != '0';
 }
 
 static u8 canonical_attr_size(GXAttr attr) {
@@ -1613,10 +1622,56 @@ struct PortmasterLayoutStats {
   u64 index16PosColor = 0;
   u64 directPosTex0 = 0;
   u64 directPosClr0 = 0;
+  u64 textureVertex = 0;
+  u64 storageVertex = 0;
 };
 
 static std::array<PortmasterLayoutStats, 64> s_portmasterLayoutStats{};
 static u64 s_portmasterLayoutStatDraws = 0;
+static PortmasterTimingStats s_portmasterTimingStats{};
+
+static void portmaster_note_timing_fifo(u32 fifoBytes) noexcept {
+  s_portmasterTimingStats.fifoBytes += fifoBytes;
+}
+
+static void portmaster_note_timing_native(size_t nativeBytes) noexcept {
+  ++s_portmasterTimingStats.directNativeDraws;
+  ++s_portmasterTimingStats.nativeVertexDraws;
+  s_portmasterTimingStats.nativeBytes += nativeBytes;
+}
+
+static void portmaster_note_timing_cpu_generic(size_t nativeBytes) noexcept {
+  ++s_portmasterTimingStats.cpuGenericDraws;
+  ++s_portmasterTimingStats.nativeVertexDraws;
+  s_portmasterTimingStats.nativeBytes += nativeBytes;
+}
+
+static void portmaster_note_timing_texture_vertex() noexcept {
+  ++s_portmasterTimingStats.textureVertexDraws;
+}
+
+static void portmaster_note_timing_storage_vertex() noexcept {
+  ++s_portmasterTimingStats.storageVertexDraws;
+}
+
+static void portmaster_note_noindex_triangle_draw(u16 vtxCount) noexcept {
+  ++s_portmasterTimingStats.noIndexTriangleDraws;
+  s_portmasterTimingStats.avoidedPrimitiveIndexBytes += static_cast<u64>(vtxCount) * sizeof(uint16_t);
+}
+
+static void portmaster_note_indexed_primitive_draw(size_t indexBytes) noexcept {
+  ++s_portmasterTimingStats.indexedPrimitiveDraws;
+  s_portmasterTimingStats.primitiveIndexBytes += indexBytes;
+}
+
+static void portmaster_log_layout_stats_and_reset();
+
+PortmasterTimingStats take_portmaster_timing_stats() noexcept {
+  const auto stats = s_portmasterTimingStats;
+  s_portmasterTimingStats = {};
+  portmaster_log_layout_stats_and_reset();
+  return stats;
+}
 
 static const char* portmaster_expand_path_name(PortmasterExpandPath path) {
   switch (path) {
@@ -1628,6 +1683,10 @@ static const char* portmaster_expand_path_name(PortmasterExpandPath path) {
     return "direct-pos-tex0";
   case PortmasterExpandPath::DirectPosClr0:
     return "direct-pos-clr0";
+  case PortmasterExpandPath::TextureVertex:
+    return "texture-vertex";
+  case PortmasterExpandPath::StorageVertex:
+    return "storage-vertex";
   }
   return "unknown";
 }
@@ -1651,7 +1710,7 @@ static void portmaster_note_layout_stat(GXPrimitive prim, GXVtxFmt fmt, u32 fifo
       slot = &stat;
       break;
     }
-    if (stat.nativeBytes < smallest->nativeBytes) {
+    if (stat.fifoBytes + stat.nativeBytes < smallest->fifoBytes + smallest->nativeBytes) {
       smallest = &stat;
     }
   }
@@ -1683,20 +1742,28 @@ static void portmaster_note_layout_stat(GXPrimitive prim, GXVtxFmt fmt, u32 fifo
   case PortmasterExpandPath::DirectPosClr0:
     ++slot->directPosClr0;
     break;
+  case PortmasterExpandPath::TextureVertex:
+    ++slot->textureVertex;
+    break;
+  case PortmasterExpandPath::StorageVertex:
+    ++slot->storageVertex;
+    break;
   }
 
   ++s_portmasterLayoutStatDraws;
-  if ((s_portmasterLayoutStatDraws & 0x7ff) != 0) {
+}
+
+static void portmaster_log_layout_stats_and_reset() {
+  if (!portmaster_gx_stats_enabled() || s_portmasterLayoutStatDraws == 0) {
     return;
   }
-
   std::array<const PortmasterLayoutStats*, 5> top{};
   for (const auto& stat : s_portmasterLayoutStats) {
     if (stat.draws == 0) {
       continue;
     }
     for (auto& topSlot : top) {
-      if (topSlot == nullptr || stat.nativeBytes > topSlot->nativeBytes) {
+      if (topSlot == nullptr || stat.fifoBytes + stat.nativeBytes > topSlot->fifoBytes + topSlot->nativeBytes) {
         for (auto* move = &top.back(); move != &topSlot; --move) {
           *move = *(move - 1);
         }
@@ -1706,15 +1773,18 @@ static void portmaster_note_layout_stat(GXPrimitive prim, GXVtxFmt fmt, u32 fifo
     }
   }
 
-  Log.info("PortMaster GX layout stats after {} expanded draws:", s_portmasterLayoutStatDraws);
+  Log.info("PortMaster GX layout stats: draws={}", s_portmasterLayoutStatDraws);
   for (const auto* stat : top) {
     if (stat == nullptr) {
       continue;
     }
-    Log.info("  prim={} fmt={} fifoStride={} desc=0x{:011x} draws={} vertices={} fifoBytes={} nativeBytes={} paths[g={},i16={},pt={},pc={}]",
+    Log.info("  prim={} fmt={} fifoStride={} desc=0x{:011x} draws={} vertices={} fifoBytes={} nativeBytes={} paths[g={},i16={},pt={},pc={},tex={},stor={}]",
              stat->prim, stat->fmt, stat->fifoStride, stat->descKey, stat->draws, stat->vertices, stat->fifoBytes,
-             stat->nativeBytes, stat->generic, stat->index16PosColor, stat->directPosTex0, stat->directPosClr0);
+             stat->nativeBytes, stat->generic, stat->index16PosColor, stat->directPosTex0, stat->directPosClr0,
+             stat->textureVertex, stat->storageVertex);
   }
+  s_portmasterLayoutStats = {};
+  s_portmasterLayoutStatDraws = 0;
 }
 
 static void append_f32_attr(ByteBuffer& out, const std::array<float, 4>& values, u8 count) {
@@ -2113,6 +2183,11 @@ static ByteBuffer expand_direct_pos_tex(GXVtxFmt fmt, const u8* data, u32 pos, u
 // Draw command handler - parses vertices inline and caches results
 static ByteBuffer handle_draw_idx_buf;
 
+static bool portmaster_nonindexed_triangles_enabled() noexcept {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_NOINDEX_TRIANGLES");
+  return value == nullptr || value[0] == '\0' || value[0] != '0';
+}
+
 static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
   ZoneScoped;
   u8 opcode = cmd & CP_OPCODE_MASK;
@@ -2135,26 +2210,29 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     handle_draw_overrun(totalVtxBytes, data, pos, size);
   }
 
-  const bool portmasterNoVertexStorage =
-      portmaster_no_vertex_storage_mode() && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
-  if (portmasterNoVertexStorage && can_expand_direct_pos_tex(fmt, vtxSize)) {
+  const bool portmasterNoVertexStorage = portmaster_no_vertex_storage_mode();
+  const bool forceTextureVertexFetch = portmasterNoVertexStorage && portmaster_texture_vertex_fetch_mode();
+  portmaster_note_timing_fifo(totalVtxBytes);
+  if (portmasterNoVertexStorage && !forceTextureVertexFetch && can_expand_direct_pos_tex(fmt, vtxSize)) {
     if (portmaster_gx_debug_log_allowed()) {
       Log.info("PortMaster GX expand DIRECT POS+TEX0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
                static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
     }
     auto expanded = expand_direct_pos_tex(fmt, data, pos, vtxCount, bigEndian);
+    portmaster_note_timing_native(expanded.size());
     portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded.size(), PortmasterExpandPath::DirectPosTex0);
     pos += totalVtxBytes;
     const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
     handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
     return;
   }
-  if (portmasterNoVertexStorage && can_expand_direct_pos_color(fmt, vtxSize)) {
+  if (portmasterNoVertexStorage && !forceTextureVertexFetch && can_expand_direct_pos_color(fmt, vtxSize)) {
     if (portmaster_gx_debug_log_allowed()) {
       Log.info("PortMaster GX expand DIRECT POS+CLR0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
                static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
     }
     auto expanded = expand_direct_pos_color(fmt, data, pos, vtxCount, bigEndian);
+    portmaster_note_timing_native(expanded.size());
     portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded.size(), PortmasterExpandPath::DirectPosClr0);
     pos += totalVtxBytes;
     const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
@@ -2162,7 +2240,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     return;
   }
 
-  if (portmasterNoVertexStorage) {
+  if (portmasterNoVertexStorage && !forceTextureVertexFetch) {
     if (auto expanded = expand_portmaster_generic_draw(fmt, data, pos, vtxCount, vtxSize, bigEndian)) {
       if (portmaster_gx_debug_log_allowed()) {
         Log.info("PortMaster GX generic native expand draw: prim={} fmt={} vtxCount={} fifoStride={} nativeStride={} bytes={}",
@@ -2170,6 +2248,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
                  expanded->vertices.size());
       }
       portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, expanded->vertices.size(), PortmasterExpandPath::Generic);
+      portmaster_note_timing_cpu_generic(expanded->vertices.size());
       pos += totalVtxBytes;
       const gfx::Range vertRange = gfx::push_verts(expanded->vertices.data(), expanded->vertices.size());
       handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, &expanded->shaderConfig);
@@ -2177,23 +2256,25 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     }
   }
 
-  if (can_expand_index16_pos_color(fmt, vtxSize)) {
+  if (!forceTextureVertexFetch && can_expand_index16_pos_color(fmt, vtxSize)) {
     if (portmaster_gx_debug_log_allowed()) {
       Log.info("PortMaster GX expand INDEX16 draw: prim={} fmt={} vtxCount={} fifoStride={}", static_cast<u32>(prim),
                static_cast<u32>(fmt), vtxCount, vtxSize);
     }
     auto expanded = expand_index16_pos_color(data, pos, vtxCount, vtxSize, bigEndian);
+    portmaster_note_timing_native(expanded.size());
     pos += totalVtxBytes;
     const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
     handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
     return;
   }
-  if (can_expand_direct_pos_tex(fmt, vtxSize)) {
+  if (!forceTextureVertexFetch && can_expand_direct_pos_tex(fmt, vtxSize)) {
     if (portmaster_gx_debug_log_allowed()) {
       Log.info("PortMaster GX expand DIRECT POS+TEX0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
                static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
     }
     auto expanded = expand_direct_pos_tex(fmt, data, pos, vtxCount, bigEndian);
+    portmaster_note_timing_native(expanded.size());
     pos += totalVtxBytes;
     const gfx::Range vertRange = gfx::push_verts(expanded.data(), expanded.size());
     handle_draw_unmerged(prim, fmt, vtxCount, vertRange, true);
@@ -2202,6 +2283,17 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
   // Push raw vertex data to buffer
   gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes);
+  if (forceTextureVertexFetch) {
+    if (portmaster_gx_debug_log_allowed()) {
+      Log.info("PortMaster GX texture vertex fetch draw: prim={} fmt={} vtxCount={} fifoStride={}",
+               static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
+    }
+    portmaster_note_timing_texture_vertex();
+    portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, 0, PortmasterExpandPath::TextureVertex);
+  } else {
+    portmaster_note_timing_storage_vertex();
+    portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, 0, PortmasterExpandPath::StorageVertex);
+  }
   pos += totalVtxBytes;
 
   // Try to merge with previous draw call
@@ -2209,18 +2301,31 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     auto* lastDraw = gfx::get_last_draw_command<DrawData>();
     // Only if the previous draw call was a single instance draw (no lines/points handling)
     if (lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
-        lastDraw->instanceCount == 1) LIKELY {
-      u32 numIndices = prepare_idx_buffer(handle_draw_idx_buf, prim, lastDraw->vtxCount, vtxCount);
-      gfx::Range idxRange = gfx::push_indices(handle_draw_idx_buf.data(), handle_draw_idx_buf.size());
-      handle_draw_idx_buf.clear();
+        lastDraw->instanceCount == 1 && lastDraw->textureVertexFetch == forceTextureVertexFetch) LIKELY {
       CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
             "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
             vertRange.offset);
-      CHECK(lastDraw->idxRange.offset + lastDraw->idxRange.size == idxRange.offset,
-            "Non-consecutive index ranges ({} < {})", lastDraw->idxRange.offset + lastDraw->idxRange.size,
-            idxRange.offset);
+      const bool useNonIndexedTriangles =
+          prim == GX_TRIANGLES && portmaster_nonindexed_triangles_enabled() && lastDraw->idxRange.size == 0;
+      if (lastDraw->idxRange.size == 0 && !useNonIndexedTriangles) {
+        handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, nullptr, forceTextureVertexFetch);
+        return;
+      }
+
+      u32 numIndices = vtxCount;
+      if (useNonIndexedTriangles) {
+        portmaster_note_noindex_triangle_draw(vtxCount);
+      } else {
+        numIndices = prepare_idx_buffer(handle_draw_idx_buf, prim, lastDraw->vtxCount, vtxCount);
+        portmaster_note_indexed_primitive_draw(handle_draw_idx_buf.size());
+        gfx::Range idxRange = gfx::push_indices(handle_draw_idx_buf.data(), handle_draw_idx_buf.size());
+        handle_draw_idx_buf.clear();
+        CHECK(lastDraw->idxRange.offset + lastDraw->idxRange.size == idxRange.offset,
+              "Non-consecutive index ranges ({} < {})", lastDraw->idxRange.offset + lastDraw->idxRange.size,
+              idxRange.offset);
+        lastDraw->idxRange.size += idxRange.size;
+      }
       lastDraw->vertRange.size += vertRange.size;
-      lastDraw->idxRange.size += idxRange.size;
       lastDraw->vtxCount += vtxCount;
       lastDraw->indexCount += numIndices;
       ++gfx::g_mergedDrawCallCount;
@@ -2228,21 +2333,26 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
     }
   }
 
-  handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+  handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, nullptr, forceTextureVertexFetch);
 }
 
 static ByteBuffer handle_draw_unmerged_idxBuf;
 
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
-                                 bool forceNativePosColor, const ShaderConfig* forcedNativeShaderConfig) {
+                                 bool forceNativePosColor, const ShaderConfig* forcedNativeShaderConfig,
+                                 bool forceTextureVertexFetch) {
   ZoneScoped;
   u32 numIndices = 0;
   gfx::Range idxRange;
 
-  {
+  if (prim == GX_TRIANGLES && portmaster_nonindexed_triangles_enabled()) {
+    numIndices = vtxCount;
+    portmaster_note_noindex_triangle_draw(vtxCount);
+  } else {
     ByteBuffer idxBuf;
     auto& realBuf = vtxCount < 1000 ? handle_draw_unmerged_idxBuf : idxBuf;
     numIndices = prepare_idx_buffer(realBuf, prim, 0, vtxCount);
+    portmaster_note_indexed_primitive_draw(realBuf.size());
     idxRange = gfx::push_indices(realBuf.data(), realBuf.size());
     realBuf.clear();
   }
@@ -2330,6 +2440,11 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
                config.shaderConfig.vtxStride, vtxCount, vertRange.size);
     }
   }
+  if (forceTextureVertexFetch) {
+    config.shaderConfig.nativeVertexFetch = false;
+    config.shaderConfig.textureVertexFetch = true;
+    config.shaderConfig.lineMode = 0;
+  }
   const auto info = build_shader_info(config.shaderConfig);
   resolve_sampled_textures(info);
   const auto bindGroups = build_bind_groups(info);
@@ -2354,6 +2469,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       .bindGroups = bindGroups,
       .dstAlpha = g_gxState.dstAlpha,
       .nativeVertexFetch = config.shaderConfig.nativeVertexFetch != 0,
+      .textureVertexFetch = config.shaderConfig.textureVertexFetch != 0,
   });
 }
 

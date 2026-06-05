@@ -1,6 +1,12 @@
 #include "BackendBinding.hpp"
 
+#include <cstdlib>
+#include <cstdint>
+#include <fcntl.h>
+#include <linux/fb.h>
 #include <memory>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #if !defined(SDL_PLATFORM_MACOS) && !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_TVOS)
 #include <SDL3/SDL_video.h>
@@ -8,6 +14,32 @@
 
 namespace aurora::webgpu::utils {
 std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptorCocoa(SDL_Window* window);
+
+namespace {
+#if defined(SDL_PLATFORM_LINUX)
+struct PortmasterFbdevWindow {
+  unsigned short width;
+  unsigned short height;
+};
+
+PortmasterFbdevWindow g_portmasterFbdevWindow{};
+
+bool init_portmaster_fbdev_window() {
+  int fd = open("/dev/fb0", O_RDWR, 0);
+  fb_var_screeninfo vinfo{};
+  if (fd < 0 || ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) < 0) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    return false;
+  }
+  close(fd);
+  g_portmasterFbdevWindow.width = static_cast<unsigned short>(vinfo.xres);
+  g_portmasterFbdevWindow.height = static_cast<unsigned short>(vinfo.yres);
+  return true;
+}
+#endif
+} // namespace
 
 std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Window* window) {
 #if defined(SDL_PLATFORM_MACOS) || defined(SDL_PLATFORM_IOS) || defined(SDL_PLATFORM_TVOS)
@@ -25,6 +57,12 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
   desc->hinstance = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, nullptr);
   return std::move(desc);
 #elif defined(SDL_PLATFORM_LINUX)
+  if (std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr && init_portmaster_fbdev_window()) {
+    std::shared_ptr<wgpu::SurfaceSourceXlibWindow> desc = std::make_shared<wgpu::SurfaceSourceXlibWindow>();
+    desc->display = nullptr;
+    desc->window = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&g_portmasterFbdevWindow));
+    return std::move(desc);
+  }
   const char* driver = SDL_GetCurrentVideoDriver();
   if (SDL_strcmp(driver, "wayland") == 0) {
     std::shared_ptr<wgpu::SurfaceSourceWaylandSurface> desc = std::make_shared<wgpu::SurfaceSourceWaylandSurface>();
