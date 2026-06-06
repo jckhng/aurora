@@ -179,11 +179,20 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
   const double fps = seconds > 0.0 ? static_cast<double>(s_timingFrames) / seconds : 0.0;
   const double avgFrameMs = s_timingFrames > 0 ? static_cast<double>(s_timingFrameUs) / static_cast<double>(s_timingFrames) / 1000.0 : 0.0;
   const double maxFrameMs = static_cast<double>(s_timingMaxFrameUs) / 1000.0;
-  Log.info("PortMaster timing: fps={:.2f} frames={} avg_cpu_frame_ms={:.1f} max_cpu_frame_ms={:.1f} draws_last={} uploads[v={} i={} s={}] gx_draws[tex={} cpu={} native={} storage={}] gx_bytes[fifo={} native={}] gx_index[noidx={} idx={} avoided={} bytes={}]",
+  Log.info("PortMaster timing: fps={:.2f} frames={} avg_cpu_frame_ms={:.1f} max_cpu_frame_ms={:.1f} draws_last={} uploads[v={} i={} s={}] gx_draws[tex={} cpu={} native={} storage={}] gx_bytes[fifo={} native={}] gx_index[noidx={} idx={} avoided={} bytes={} cache_hit={} cache_miss={}] gx_merge[try={} ok={} dirty={} none={} line={} inst={} tex={} idx={}] gx_dirty[bp={} xf={} cp={} arr={} tex={} other={} cp_skip={} xf_skip={}] gx_batch[strip_runs={} strip_draws={} strip_vtx={} strip_max={} quad_runs={} quad_draws={} quad_vtx={} quad_max={}] gx_prim[q={} tri={} strip={} fan={} line={} lstrip={} point={} other={} vtx={}]",
            fps, s_timingFrames, avgFrameMs, maxFrameMs, drawCount, vertexWriteSize, indexWriteSize, storageWriteSize,
            gxStats.textureVertexDraws, gxStats.cpuGenericDraws, gxStats.directNativeDraws, gxStats.storageVertexDraws,
            gxStats.fifoBytes, gxStats.nativeBytes, gxStats.noIndexTriangleDraws, gxStats.indexedPrimitiveDraws,
-           gxStats.avoidedPrimitiveIndexBytes, gxStats.primitiveIndexBytes);
+           gxStats.avoidedPrimitiveIndexBytes, gxStats.primitiveIndexBytes, gxStats.primitiveIndexCacheHits,
+           gxStats.primitiveIndexCacheMisses, gxStats.mergeAttempts, gxStats.mergeSuccesses,
+           gxStats.mergeBlockedStateDirty, gxStats.mergeBlockedNoPrevious, gxStats.mergeBlockedLinePoint,
+           gxStats.mergeBlockedInstance, gxStats.mergeBlockedTextureMode, gxStats.mergeBlockedIndexMode,
+           gxStats.mergeDirtyBp, gxStats.mergeDirtyXf, gxStats.mergeDirtyCp, gxStats.mergeDirtyArray,
+           gxStats.mergeDirtyTexture, gxStats.mergeDirtyOther, gxStats.cpDuplicateSkips, gxStats.xfDuplicateSkips,
+           gxStats.stripBatchRuns, gxStats.stripBatchDraws, gxStats.stripBatchVertices, gxStats.stripBatchMaxDraws,
+           gxStats.quadBatchRuns, gxStats.quadBatchDraws, gxStats.quadBatchVertices, gxStats.quadBatchMaxDraws, gxStats.primQuads,
+           gxStats.primTriangles, gxStats.primTriangleStrips, gxStats.primTriangleFans, gxStats.primLines,
+           gxStats.primLineStrips, gxStats.primPoints, gxStats.primOther, gxStats.primVertices);
 
   s_timingIntervalStart = now;
   s_timingFrames = 0;
@@ -1047,6 +1056,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
   // Bind static bind group for the whole pass
   pass.SetBindGroup(0, g_staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
+  gx::reset_render_state();
 
   for (const auto& cmd : g_renderPasses[idx].commands) {
 #ifdef AURORA_GFX_DEBUG_GROUPS

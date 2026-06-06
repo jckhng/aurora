@@ -586,10 +586,10 @@ static inline wgpu::ColorWriteMask to_write_mask(bool colorUpdate, bool alphaUpd
   return writeMask;
 }
 
-static inline wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
+static inline wgpu::PrimitiveState to_primitive_state(const PipelineConfig& config) {
   auto cullMode = wgpu::CullMode::None;
-  switch (gx_cullMode) {
-    DEFAULT_FATAL("unsupported cull mode {}", underlying(gx_cullMode));
+  switch (config.cullMode) {
+    DEFAULT_FATAL("unsupported cull mode {}", underlying(config.cullMode));
   case GX_CULL_FRONT:
     cullMode = wgpu::CullMode::Front;
     break;
@@ -600,8 +600,9 @@ static inline wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
     break;
   }
   return {
-      .topology = wgpu::PrimitiveTopology::TriangleList,
-      .stripIndexFormat = wgpu::IndexFormat::Undefined,
+      .topology = config.triangleStripTopology ? wgpu::PrimitiveTopology::TriangleStrip
+                                                : wgpu::PrimitiveTopology::TriangleList,
+      .stripIndexFormat = config.triangleStripTopology ? wgpu::IndexFormat::Uint16 : wgpu::IndexFormat::Undefined,
       .frontFace = wgpu::FrontFace::CW,
       .cullMode = cullMode,
   };
@@ -643,7 +644,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
               .bufferCount = static_cast<uint32_t>(vtxBuffers.size()),
               .buffers = vtxBuffers.data(),
           },
-      .primitive = to_primitive_state(config.cullMode),
+      .primitive = to_primitive_state(config),
       .depthStencil = &depthStencil,
       .multisample =
           wgpu::MultisampleState{
