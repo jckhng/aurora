@@ -19,6 +19,7 @@
 #include <bit>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -44,6 +45,14 @@ static wgpu::PipelineLayout sTextureVertexPipelineLayout;
 wgpu::BindGroup g_emptyTextureBindGroup;
 
 namespace {
+template <typename To, typename From>
+To pm_bit_cast(const From& from) noexcept {
+  static_assert(sizeof(To) == sizeof(From));
+  To to;
+  std::memcpy(&to, &from, sizeof(To));
+  return to;
+}
+
 struct DynamicPaletteKey {
   const void* sourceIdentity = nullptr;
   u32 width = 0;
@@ -611,15 +620,15 @@ static inline wgpu::PrimitiveState to_primitive_state(const PipelineConfig& conf
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept {
   ZoneScoped;
-  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
-  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
+  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * pm_bit_cast<float>(config.polygonOffsetBits);
+  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * pm_bit_cast<float>(config.polygonOffsetScaleBits);
   const wgpu::DepthStencilState depthStencil{
       .format = g_graphicsConfig.depthFormat,
       .depthWriteEnabled = config.depthCompare && config.depthUpdate,
       .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
       .depthBias = round_away_from_zero<int32_t>(depthBias),
       .depthBiasSlopeScale = depthBiasSlopeScale,
-      .depthBiasClamp = std::bit_cast<float>(config.polygonOffsetClampBits),
+      .depthBiasClamp = pm_bit_cast<float>(config.polygonOffsetClampBits),
   };
   const auto blendState =
       to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha);
@@ -889,9 +898,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .blendFacDst = g_gxState.blendFacDst,
       .blendOp = g_gxState.blendOp,
       .dstAlpha = g_gxState.dstAlpha,
-      .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
-      .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
-      .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
+      .polygonOffsetBits = pm_bit_cast<uint32_t>(polygonOffset),
+      .polygonOffsetScaleBits = pm_bit_cast<uint32_t>(polygonOffsetScale),
+      .polygonOffsetClampBits = pm_bit_cast<uint32_t>(g_gxState.clamp),
       .depthCompare = g_gxState.depthCompare,
       .depthUpdate = g_gxState.depthUpdate,
       .alphaUpdate = g_gxState.alphaUpdate,

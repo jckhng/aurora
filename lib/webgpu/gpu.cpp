@@ -734,9 +734,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       featureLevel = wgpu::FeatureLevel::Compatibility;
     }
     const wgpu::RequestAdapterOptions options{
+        .featureLevel = featureLevel,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
-        .featureLevel = featureLevel,
         .compatibleSurface = std::getenv("DUSKLIGHT_PORTMASTER_SKIP_COMPAT_SURFACE") == nullptr ? g_surface : nullptr,
     };
     const auto future = g_instance.RequestAdapter(
