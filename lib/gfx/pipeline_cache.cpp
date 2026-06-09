@@ -537,6 +537,10 @@ static void load_pipeline_cache_entries(ShaderType type, uint32_t configVersion,
 }
 
 static void load_pipeline_cache() {
+  if (std::getenv("DUSKLIGHT_PORTMASTER_SKIP_PIPELINE_CACHE_LOAD") != nullptr) {
+    Log.warn("Skipping pipeline cache load due to DUSKLIGHT_PORTMASTER_SKIP_PIPELINE_CACHE_LOAD");
+    return;
+  }
   if (!prepare_pipeline_cache_db()) {
     return;
   }

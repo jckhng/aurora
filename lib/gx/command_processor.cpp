@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <vector>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
@@ -59,25 +60,239 @@ enum PortmasterDirtyReason : u32 {
 
 static u32 s_portmasterDirtyReasons = 0;
 
+enum PortmasterBpDirtyReason : u32 {
+  PortmasterBpDirtyTevCombiner = 1u << 0,
+  PortmasterBpDirtyTevOrder = 1u << 1,
+  PortmasterBpDirtyRenderState = 1u << 2,
+  PortmasterBpDirtyTexCoord = 1u << 3,
+  PortmasterBpDirtyIndTex = 1u << 4,
+  PortmasterBpDirtyFog = 1u << 5,
+  PortmasterBpDirtyTevReg = 1u << 6,
+  PortmasterBpDirtyTexture = 1u << 7,
+  PortmasterBpDirtyOther = 1u << 8,
+};
+
+enum PortmasterXfDirtyReason : u32 {
+  PortmasterXfDirtyPosMtx = 1u << 0,
+  PortmasterXfDirtyTexMtx = 1u << 1,
+  PortmasterXfDirtyNrmMtx = 1u << 2,
+  PortmasterXfDirtyPTTexMtx = 1u << 3,
+  PortmasterXfDirtyLight = 1u << 4,
+  PortmasterXfDirtyChannel = 1u << 5,
+  PortmasterXfDirtyMtxIdx = 1u << 6,
+  PortmasterXfDirtyViewport = 1u << 7,
+  PortmasterXfDirtyProjection = 1u << 8,
+  PortmasterXfDirtyTexGen = 1u << 9,
+  PortmasterXfDirtyOther = 1u << 10,
+};
+
+static u32 s_portmasterBpDirtyReasons = 0;
+static u32 s_portmasterXfDirtyReasons = 0;
+static std::array<bool, 0x700> s_portmasterPendingXfDirtyAddrs{};
+static u8 s_portmasterCurrentBpRegId = 0xff;
+static u32 s_portmasterPendingTevRegMask = 0;
+static u32 s_portmasterPendingKColorMask = 0;
+
 static void portmaster_mark_state_dirty(u32 reason) noexcept {
   g_gxState.stateDirty = true;
   s_portmasterDirtyReasons |= reason;
 }
 
-static void portmaster_mark_xf_dirty_if_changed(bool changed) noexcept {
+static void portmaster_mark_bp_dirty(u32 reason) noexcept {
+  s_portmasterBpDirtyReasons |= reason;
+  ++s_portmasterTimingStats.bpDirtyRegCounts[s_portmasterCurrentBpRegId];
+  portmaster_mark_state_dirty(PortmasterDirtyBp);
+}
+
+static void portmaster_note_xf_addr(std::array<u64, 0x700>& counts, u32 addr) noexcept {
+  if (addr < counts.size()) {
+    ++counts[addr];
+  }
+}
+
+static void portmaster_count_xf_dirty_reason(u32 reason, PortmasterTimingStats& stats) noexcept {
+  if ((reason & PortmasterXfDirtyPosMtx) != 0) {
+    ++stats.xfDirtyPosMtx;
+  }
+  if ((reason & PortmasterXfDirtyTexMtx) != 0) {
+    ++stats.xfDirtyTexMtx;
+  }
+  if ((reason & PortmasterXfDirtyNrmMtx) != 0) {
+    ++stats.xfDirtyNrmMtx;
+  }
+  if ((reason & PortmasterXfDirtyPTTexMtx) != 0) {
+    ++stats.xfDirtyPTTexMtx;
+  }
+  if ((reason & PortmasterXfDirtyLight) != 0) {
+    ++stats.xfDirtyLight;
+  }
+  if ((reason & PortmasterXfDirtyChannel) != 0) {
+    ++stats.xfDirtyChannel;
+  }
+  if ((reason & PortmasterXfDirtyMtxIdx) != 0) {
+    ++stats.xfDirtyMtxIdx;
+  }
+  if ((reason & PortmasterXfDirtyViewport) != 0) {
+    ++stats.xfDirtyViewport;
+  }
+  if ((reason & PortmasterXfDirtyProjection) != 0) {
+    ++stats.xfDirtyProjection;
+  }
+  if ((reason & PortmasterXfDirtyTexGen) != 0) {
+    ++stats.xfDirtyTexGen;
+  }
+  if (reason == 0 || (reason & PortmasterXfDirtyOther) != 0) {
+    ++stats.xfDirtyOther;
+  }
+}
+
+static void portmaster_count_xf_block_reason(u32 reason, PortmasterTimingStats& stats) noexcept {
+  if ((reason & PortmasterXfDirtyPosMtx) != 0) {
+    ++stats.xfBlockPosMtx;
+  }
+  if ((reason & PortmasterXfDirtyTexMtx) != 0) {
+    ++stats.xfBlockTexMtx;
+  }
+  if ((reason & PortmasterXfDirtyNrmMtx) != 0) {
+    ++stats.xfBlockNrmMtx;
+  }
+  if ((reason & PortmasterXfDirtyPTTexMtx) != 0) {
+    ++stats.xfBlockPTTexMtx;
+  }
+  if ((reason & PortmasterXfDirtyLight) != 0) {
+    ++stats.xfBlockLight;
+  }
+  if ((reason & PortmasterXfDirtyChannel) != 0) {
+    ++stats.xfBlockChannel;
+  }
+  if ((reason & PortmasterXfDirtyMtxIdx) != 0) {
+    ++stats.xfBlockMtxIdx;
+  }
+  if ((reason & PortmasterXfDirtyViewport) != 0) {
+    ++stats.xfBlockViewport;
+  }
+  if ((reason & PortmasterXfDirtyProjection) != 0) {
+    ++stats.xfBlockProjection;
+  }
+  if ((reason & PortmasterXfDirtyTexGen) != 0) {
+    ++stats.xfBlockTexGen;
+  }
+  if (reason == 0 || (reason & PortmasterXfDirtyOther) != 0) {
+    ++stats.xfBlockOther;
+  }
+}
+
+static void portmaster_mark_xf_dirty(u32 reason, u32 addr) noexcept {
+  s_portmasterXfDirtyReasons |= reason;
+  portmaster_count_xf_dirty_reason(reason, s_portmasterTimingStats);
+  portmaster_note_xf_addr(s_portmasterTimingStats.xfDirtyAddrCounts, addr);
+  if (addr < s_portmasterPendingXfDirtyAddrs.size()) {
+    s_portmasterPendingXfDirtyAddrs[addr] = true;
+  }
+  portmaster_mark_state_dirty(PortmasterDirtyXf);
+}
+
+static void portmaster_mark_tev_reg_dirty(u32 idx, bool isKColor) noexcept {
+  ++s_portmasterTimingStats.bpDirtyRegCounts[s_portmasterCurrentBpRegId];
+  if (isKColor) {
+    s_portmasterPendingKColorMask |= 1u << idx;
+  } else {
+    s_portmasterPendingTevRegMask |= 1u << idx;
+  }
+}
+
+static void portmaster_resolve_deferred_tev_reg_dirty(const ShaderInfo& info) noexcept {
+  if (s_portmasterPendingTevRegMask == 0 && s_portmasterPendingKColorMask == 0) {
+    return;
+  }
+
+  u32 usedTevRegMask = 0;
+  for (u32 i = 0; i < info.loadsTevReg.size(); ++i) {
+    if (info.loadsTevReg.test(i)) {
+      usedTevRegMask |= 1u << i;
+    }
+  }
+  u32 usedKColorMask = 0;
+  for (u32 i = 0; i < info.sampledKColors.size(); ++i) {
+    if (info.sampledKColors.test(i)) {
+      usedKColorMask |= 1u << i;
+    }
+  }
+
+  if ((s_portmasterPendingTevRegMask & usedTevRegMask) != 0 ||
+      (s_portmasterPendingKColorMask & usedKColorMask) != 0) {
+    s_portmasterBpDirtyReasons |= PortmasterBpDirtyTevReg;
+    portmaster_mark_state_dirty(PortmasterDirtyBp);
+  }
+  s_portmasterPendingTevRegMask = 0;
+  s_portmasterPendingKColorMask = 0;
+}
+
+static void portmaster_mark_xf_dirty_if_changed(bool changed, u32 reason, u32 addr) noexcept {
   if (changed) {
-    portmaster_mark_state_dirty(PortmasterDirtyXf);
+    portmaster_mark_xf_dirty(reason, addr);
     return;
   }
   ++s_portmasterTimingStats.xfDuplicateSkips;
 }
 
+static bool portmaster_skip_duplicate_scalar_xf_write(u32 reg, u32 val) noexcept {
+  // Viewport/projection registers are multi-word payloads; do not skip them from
+  // a single scalar word comparison.
+  const bool cacheableScalar = (reg <= 0x19) || (reg >= 0x3f && reg <= 0x5f);
+  if (!cacheableScalar || reg >= g_gxState.xfRegCache.size()) {
+    return false;
+  }
+
+  if (g_gxState.xfRegCacheValid[reg] && val == g_gxState.xfRegCache[reg]) {
+    ++s_portmasterTimingStats.xfDuplicateSkips;
+    return true;
+  }
+
+  g_gxState.xfRegCache[reg] = val;
+  g_gxState.xfRegCacheValid[reg] = true;
+  return false;
+}
+
 static void portmaster_note_dirty_merge_block() noexcept {
   if ((s_portmasterDirtyReasons & PortmasterDirtyBp) != 0) {
     ++s_portmasterTimingStats.mergeDirtyBp;
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyTevCombiner) != 0) {
+      ++s_portmasterTimingStats.bpDirtyTevCombiner;
+    }
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyTevOrder) != 0) {
+      ++s_portmasterTimingStats.bpDirtyTevOrder;
+    }
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyRenderState) != 0) {
+      ++s_portmasterTimingStats.bpDirtyRenderState;
+    }
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyTexCoord) != 0) {
+      ++s_portmasterTimingStats.bpDirtyTexCoord;
+    }
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyIndTex) != 0) {
+      ++s_portmasterTimingStats.bpDirtyIndTex;
+    }
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyFog) != 0) {
+      ++s_portmasterTimingStats.bpDirtyFog;
+    }
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyTevReg) != 0) {
+      ++s_portmasterTimingStats.bpDirtyTevReg;
+    }
+    if ((s_portmasterBpDirtyReasons & PortmasterBpDirtyTexture) != 0) {
+      ++s_portmasterTimingStats.bpDirtyTexture;
+    }
+    if (s_portmasterBpDirtyReasons == 0 || (s_portmasterBpDirtyReasons & PortmasterBpDirtyOther) != 0) {
+      ++s_portmasterTimingStats.bpDirtyOther;
+    }
   }
   if ((s_portmasterDirtyReasons & PortmasterDirtyXf) != 0) {
     ++s_portmasterTimingStats.mergeDirtyXf;
+    portmaster_count_xf_block_reason(s_portmasterXfDirtyReasons, s_portmasterTimingStats);
+    for (u32 addr = 0; addr < s_portmasterPendingXfDirtyAddrs.size(); ++addr) {
+      if (s_portmasterPendingXfDirtyAddrs[addr]) {
+        portmaster_note_xf_addr(s_portmasterTimingStats.xfBlockAddrCounts, addr);
+      }
+    }
   }
   if ((s_portmasterDirtyReasons & PortmasterDirtyCp) != 0) {
     ++s_portmasterTimingStats.mergeDirtyCp;
@@ -92,6 +307,9 @@ static void portmaster_note_dirty_merge_block() noexcept {
     ++s_portmasterTimingStats.mergeDirtyOther;
   }
   s_portmasterDirtyReasons = 0;
+  s_portmasterBpDirtyReasons = 0;
+  s_portmasterXfDirtyReasons = 0;
+  s_portmasterPendingXfDirtyAddrs = {};
 }
 
 static bool portmaster_strip_topology_enabled() noexcept {
@@ -190,6 +408,17 @@ static u16 build_triangle_strip_topology_indices(ByteBuffer& buf, u16 vtxStart, 
     buf.append(static_cast<u16>(vtxStart + v));
   }
   return numIndices;
+}
+
+static u32 build_triangle_strip_batch_topology_indices(ByteBuffer& buf, const std::vector<u16>& stripCounts) {
+  u32 indexCount = 0;
+  u16 vtxStart = 0;
+  for (size_t i = 0; i < stripCounts.size(); ++i) {
+    const bool restart = i != 0;
+    indexCount += build_triangle_strip_topology_indices(buf, vtxStart, stripCounts[i], restart);
+    vtxStart = static_cast<u16>(vtxStart + stripCounts[i]);
+  }
+  return indexCount;
 }
 
 static const ByteBuffer& portmaster_cached_index_pattern(GXPrimitive prim, u16 vtxCount, u16& numIndices) {
@@ -394,7 +623,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
       changed |= flat[i] != val;
       flat[i] = val;
     }
-    portmaster_mark_xf_dirty_if_changed(changed);
+    portmaster_mark_xf_dirty_if_changed(changed, PortmasterXfDirtyPosMtx, addr);
     return true;
   } else if (addr < 0x0F0) {
     // Texture matrices (0x078-0x0EF)
@@ -414,7 +643,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
       changed |= flat[i] != val;
       flat[i] = val;
     }
-    portmaster_mark_xf_dirty_if_changed(changed);
+    portmaster_mark_xf_dirty_if_changed(changed, PortmasterXfDirtyTexMtx, addr);
     return true;
   } else if (addr >= 0x400 && addr < 0x45A) {
     // Normal matrices (0x400-0x459)
@@ -437,7 +666,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
         flat[row * 4 + col] = val;
       }
     }
-    portmaster_mark_xf_dirty_if_changed(changed);
+    portmaster_mark_xf_dirty_if_changed(changed, PortmasterXfDirtyNrmMtx, addr);
     return true;
   } else if (addr >= 0x500 && addr < 0x5F0) {
     // Post-transform texture matrices (0x500-0x5EF)
@@ -454,7 +683,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
       changed |= flat[startOffset + i] != val;
       flat[startOffset + i] = val;
     }
-    portmaster_mark_xf_dirty_if_changed(changed);
+    portmaster_mark_xf_dirty_if_changed(changed, PortmasterXfDirtyPTTexMtx, addr);
     return true;
   } else if (addr >= 0x600 && addr < 0x680) {
     // Lights (0x600-0x67F) - 8 lights, 16 values each
@@ -514,7 +743,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
         break; // padding (0-2)
       }
     }
-    portmaster_mark_xf_dirty_if_changed(light != previous);
+    portmaster_mark_xf_dirty_if_changed(light != previous, PortmasterXfDirtyLight, addr);
     return true;
   }
   return false;
@@ -646,6 +875,7 @@ inline static u32 bp_get(u32 reg, u32 size, u32 shift) { return reg >> shift & (
 // BP register handler - decodes BP (RAS/pixel engine) register writes and updates g_gxState
 static void handle_bp(u32 value, bool bigEndian) {
   u32 regId = (value >> 24) & 0xFF;
+  s_portmasterCurrentBpRegId = static_cast<u8>(regId);
   // Mask off the register ID from the value for field extraction
   // (the regId is stored in bits 24-31, data is in bits 0-23)
 
@@ -684,7 +914,7 @@ static void handle_bp(u32 value, bool bigEndian) {
         s.colorOp.bias = static_cast<GXTevBias>(bp_get(value, 2, 16));
         s.colorOp.scale = static_cast<GXTevScale>(bp_get(value, 2, 20));
       }
-      portmaster_mark_state_dirty(PortmasterDirtyBp);
+      portmaster_mark_bp_dirty(PortmasterBpDirtyTevCombiner);
     }
     return;
   }
@@ -712,7 +942,7 @@ static void handle_bp(u32 value, bool bigEndian) {
         s.alphaOp.bias = static_cast<GXTevBias>(bp_get(value, 2, 16));
         s.alphaOp.scale = static_cast<GXTevScale>(bp_get(value, 2, 20));
       }
-      portmaster_mark_state_dirty(PortmasterDirtyBp);
+      portmaster_mark_bp_dirty(PortmasterBpDirtyTevCombiner);
     }
     return;
   }
@@ -737,7 +967,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       break;
     }
     g_gxState.numIndStages = bp_get(value, 3, 16);
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyOther);
     break;
   }
 
@@ -777,7 +1007,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       s.indTexWrapT = static_cast<GXIndTexWrap>(bp_get(value, 3, 16));
       s.indTexUseOrigLOD = bp_get(value, 1, 19) != 0;
       s.indTexAddPrev = bp_get(value, 1, 20) != 0;
-      portmaster_mark_state_dirty(PortmasterDirtyBp);
+      portmaster_mark_bp_dirty(PortmasterBpDirtyIndTex);
     }
     break;
   }
@@ -804,7 +1034,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.lineTexOffset = static_cast<GXTexOffset>(bp_get(value, 3, 16));
     g_gxState.pointTexOffset = static_cast<GXTexOffset>(bp_get(value, 3, 19));
     g_gxState.lineHalfAspect = bp_get(value, 1, 22) != 0;
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyOther);
     break;
   }
 
@@ -818,7 +1048,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.indStages[1].scaleS = static_cast<GXIndTexScale>(bp_get(value, 4, 8));
       g_gxState.indStages[1].scaleT = static_cast<GXIndTexScale>(bp_get(value, 4, 12));
     }
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyIndTex);
     break;
   }
   case 0x26: {
@@ -830,7 +1060,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.indStages[3].scaleS = static_cast<GXIndTexScale>(bp_get(value, 4, 8));
       g_gxState.indStages[3].scaleT = static_cast<GXIndTexScale>(bp_get(value, 4, 12));
     }
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyIndTex);
     break;
   }
 
@@ -840,7 +1070,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.indStages[i].texMapId = static_cast<GXTexMapID>(bp_get(value, 3, i * 6));
       g_gxState.indStages[i].texCoordId = static_cast<GXTexCoordID>(bp_get(value, 3, i * 6 + 3));
     }
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyIndTex);
     break;
   }
 
@@ -882,7 +1112,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       u32 chanHw = bp_get(value, 3, 19);
       s.channelId = (chanHw < 8) ? r2c[chanHw] : GX_COLOR_NULL;
     }
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyTevOrder);
     break;
   }
 
@@ -891,7 +1121,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.depthCompare = bp_get(value, 1, 0) != 0;
     g_gxState.depthFunc = static_cast<GXCompare>(bp_get(value, 3, 1));
     g_gxState.depthUpdate = bp_get(value, 1, 4) != 0;
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyRenderState);
     break;
   }
 
@@ -916,7 +1146,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     } else {
       g_gxState.blendMode = GX_BM_NONE;
     }
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyRenderState);
     break;
   }
 
@@ -926,7 +1156,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     bool enabled = bp_get(value, 1, 8) != 0;
     g_gxState.dstAlpha = enabled ? alpha : UINT32_MAX;
     g_gxState.pixelFmt = decode_pixel_fmt(g_gxState.bpRegCache[0x43], value);
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyRenderState);
     break;
   }
 
@@ -935,7 +1165,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.pixelFmt = decode_pixel_fmt(value, g_gxState.bpRegCache[0x42]);
     g_gxState.zFmt = static_cast<GXZFmt16>(bp_get(value, 3, 3));
     g_gxState.zCompLocBeforeTex = bp_get(value, 1, 6) != 0;
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyRenderState);
     break;
   }
 
@@ -959,7 +1189,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.alphaCompare.comp0 = static_cast<GXCompare>(bp_get(value, 3, 16));
     g_gxState.alphaCompare.comp1 = static_cast<GXCompare>(bp_get(value, 3, 19));
     g_gxState.alphaCompare.op = static_cast<GXAlphaOp>(bp_get(value, 2, 22));
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyRenderState);
     break;
   }
 
@@ -995,7 +1225,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.tevStages[stage1].kcSel = static_cast<GXTevKColorSel>(bp_get(value, 5, 14));
       g_gxState.tevStages[stage1].kaSel = static_cast<GXTevKAlphaSel>(bp_get(value, 5, 19));
     }
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyTevCombiner);
     break;
   }
 
@@ -1012,7 +1242,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     std::memcpy(&a_encoded, &a_bits, sizeof(a_encoded));
     u32 b_s = g_gxState.fog.fog2Raw & 0x1F;
     g_gxState.fog.a = std::ldexp(a_encoded, static_cast<int>(b_s));
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyFog);
     break;
   }
   // FOG1 (0xEF): B mantissa (24-bit)
@@ -1022,7 +1252,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 b_s = g_gxState.fog.fog2Raw & 0x1F;
     float B_mant = static_cast<float>(b_m) / 8388638.0f;
     g_gxState.fog.b = std::ldexp(B_mant, static_cast<int>(b_s) - 1);
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyFog);
     break;
   }
   // FOG2 (0xF0): B shift/exponent (5-bit)
@@ -1041,7 +1271,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 b_m = bp_get(g_gxState.fog.fog1Raw, 24, 0);
     float B_mant = static_cast<float>(b_m) / 8388638.0f;
     g_gxState.fog.b = std::ldexp(B_mant, static_cast<int>(b_s) - 1);
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyFog);
     break;
   }
 
@@ -1055,7 +1285,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 c_sign = bp_get(value, 1, 19);
     u32 c_bits = (c_sign << 31) | (c_exp << 23) | (c_mant << 12);
     std::memcpy(&g_gxState.fog.c, &c_bits, sizeof(g_gxState.fog.c));
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyFog);
     break;
   }
 
@@ -1070,7 +1300,7 @@ static void handle_bp(u32 value, bool bigEndian) {
         static_cast<float>(b) / 255.f,
         1.f,
     };
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyFog);
     break;
   }
 
@@ -1101,7 +1331,7 @@ static void handle_bp(u32 value, bool bigEndian) {
           kc[2] = static_cast<float>(bp_get(value, 8, 0)) / 255.f;  // B
           kc[1] = static_cast<float>(bp_get(value, 8, 12)) / 255.f; // G
         }
-        portmaster_mark_state_dirty(PortmasterDirtyBp);
+        portmaster_mark_tev_reg_dirty(idx, true);
       }
     } else {
       // TEV color register (11-bit signed components)
@@ -1127,7 +1357,7 @@ static void handle_bp(u32 value, bool bigEndian) {
           cr[2] = static_cast<float>(b) / 255.f;
           cr[1] = static_cast<float>(g) / 255.f;
         }
-        portmaster_mark_state_dirty(PortmasterDirtyBp);
+        portmaster_mark_tev_reg_dirty(idx, false);
       }
     }
     break;
@@ -1173,7 +1403,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     }
     info.scaleExp = static_cast<s8>(info.adjScaleRaw) - 17;
 
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyIndTex);
     break;
   }
 
@@ -1210,7 +1440,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       tcs.lineOffset = bp_get(value, 1, 18) != 0;
       tcs.pointOffset = bp_get(value, 1, 19) != 0;
     }
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyTexCoord);
     break;
   }
 
@@ -1220,7 +1450,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u8 a = bp_get(value, 8, 8);
     g_gxState.clearColor[0] = static_cast<float>(r) / 255.f;
     g_gxState.clearColor[3] = static_cast<float>(a) / 255.f;
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    ++s_portmasterTimingStats.bpClearStateSkips;
     break;
   }
   case 0x50: {
@@ -1228,12 +1458,12 @@ static void handle_bp(u32 value, bool bigEndian) {
     u8 g = bp_get(value, 8, 8);
     g_gxState.clearColor[2] = static_cast<float>(b) / 255.f;
     g_gxState.clearColor[1] = static_cast<float>(g) / 255.f;
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    ++s_portmasterTimingStats.bpClearStateSkips;
     break;
   }
   case 0x51: {
     g_gxState.clearDepth = bp_get(value, 24, 0);
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    ++s_portmasterTimingStats.bpClearStateSkips;
     break;
   }
 
@@ -1326,7 +1556,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
   // Matrix index A (0x30)
   case 0x30: {
     g_gxState.currentPnMtx = bp_get(value, 6, 0) / 3;
-    portmaster_mark_state_dirty(PortmasterDirtyXf);
+    portmaster_mark_xf_dirty(PortmasterXfDirtyMtxIdx, 0x680);
     break;
   }
 
@@ -1443,9 +1673,10 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
       u32 reg = xfAddr + i;
       u32 val = read_u32(xfData + i * 4, bigEndian);
 
-      // Skip scalar register writes that haven't changed (viewport/projection handled below)
-      if (reg <= 0x19 && val == g_gxState.xfRegCache[reg]) continue;
-      if (reg <= 0x19) g_gxState.xfRegCache[reg] = val;
+      // Skip independent scalar register writes that have not changed.
+      if (portmaster_skip_duplicate_scalar_xf_write(reg, val)) {
+        continue;
+      }
 
       switch (reg) {
       case 0x08:
@@ -1454,31 +1685,31 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
       case 0x09:
         // numChans
         g_gxState.numChans = val;
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyChannel, reg);
         break;
       case 0x0A:
         // Ambient color 0
         g_gxState.colorChannelState[GX_COLOR0].ambColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA0].ambColor = unpack_color(val);
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyChannel, reg);
         break;
       case 0x0B:
         // Ambient color 1
         g_gxState.colorChannelState[GX_COLOR1].ambColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA1].ambColor = unpack_color(val);
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyChannel, reg);
         break;
       case 0x0C:
         // Material color 0
         g_gxState.colorChannelState[GX_COLOR0].matColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA0].matColor = unpack_color(val);
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyChannel, reg);
         break;
       case 0x0D:
         // Material color 1
         g_gxState.colorChannelState[GX_COLOR1].matColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA1].matColor = unpack_color(val);
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyChannel, reg);
         break;
       case 0x0E:
       case 0x0F:
@@ -1506,7 +1737,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
           }
           u32 lightMask = lightsLo | (lightsHi << 4);
           g_gxState.colorChannelState[chanId].lightMask = GX::LightMask{lightMask};
-          portmaster_mark_state_dirty(PortmasterDirtyXf);
+          portmaster_mark_xf_dirty(PortmasterXfDirtyChannel, reg);
         }
         break;
       }
@@ -1518,7 +1749,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
           assert(texMtx >= 0 && texMtx <= GXTexMtx::GX_IDENTITY);
           g_gxState.tcgs[i].mtx = texMtx;
         }
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyMtxIdx, reg);
         break;
       }
       case 0x19: {
@@ -1526,7 +1757,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
         for (u32 i = 0; i < 4 && (i + 4) < MaxTexCoord; i++) {
           g_gxState.tcgs[i + 4].mtx = static_cast<GXTexMtx>(bp_get(val, 6, i * 6));
         }
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyMtxIdx, reg);
         break;
       }
       case 0x1A:
@@ -1574,6 +1805,8 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
           f32 p4 = read_f32(xfData + 16, bigEndian);
           f32 p5 = read_f32(xfData + 20, bigEndian);
           u32 projType = read_u32(xfData + 24, bigEndian);
+          const auto previousProjType = g_gxState.projType;
+          const auto previousProj = g_gxState.proj;
           g_gxState.projType = static_cast<GXProjectionType>(projType);
           // Reconstruct 4x4 projection matrix from 6 params
           auto& proj = g_gxState.proj;
@@ -1591,14 +1824,17 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
             proj.m1[2] = p3;
             proj.m3[2] = -1.0f;
           }
-          portmaster_mark_state_dirty(PortmasterDirtyXf);
+          if (g_gxState.projType != previousProjType ||
+              std::memcmp(&g_gxState.proj, &previousProj, sizeof(previousProj)) != 0) {
+            portmaster_mark_xf_dirty(PortmasterXfDirtyProjection, reg);
+          }
         }
         break;
       }
       case 0x3F:
         // numTexGens
         g_gxState.numTexGens = val;
-        portmaster_mark_state_dirty(PortmasterDirtyXf);
+        portmaster_mark_xf_dirty(PortmasterXfDirtyTexGen, reg);
         break;
       default:
         // TexGen config (0x40-0x4F) and post-transform (0x50-0x5F)
@@ -1627,14 +1863,14 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
             if (srcRow < 13) {
               tcg.src = rowToSrc[srcRow];
             }
-            portmaster_mark_state_dirty(PortmasterDirtyXf);
+            portmaster_mark_xf_dirty(PortmasterXfDirtyTexGen, reg);
           }
         } else if (reg >= 0x50 && reg <= 0x5F) {
           u32 tcIdx = reg - 0x50;
           if (tcIdx < MaxTexCoord) {
             g_gxState.tcgs[tcIdx].postMtx = static_cast<GXPTTexMtx>(bp_get(val, 6, 0) + 64);
             g_gxState.tcgs[tcIdx].normalize = bp_get(val, 1, 8) != 0;
-            portmaster_mark_state_dirty(PortmasterDirtyXf);
+            portmaster_mark_xf_dirty(PortmasterXfDirtyTexGen, reg);
           }
         } else {
 #ifndef NDEBUG
@@ -1716,7 +1952,8 @@ enum class PortmasterExpandPath : u8 {
 static bool portmaster_no_vertex_storage_mode() {
   static const bool enabled = std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr ||
                               std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr ||
-                              std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr;
+                              std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr ||
+                              std::getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
   return enabled;
 }
 
@@ -2415,6 +2652,221 @@ static ByteBuffer handle_draw_strip_batch_idx_buf;
 static ByteBuffer handle_draw_quad_batch_vtx_buf;
 static ByteBuffer handle_draw_quad_batch_idx_buf;
 
+struct PortmasterBatchReuseKey {
+  GXPrimitive prim = GX_QUADS;
+  GXVtxFmt fmt = GX_VTXFMT0;
+  u32 fifoStride = 0;
+  u32 vertexBytes = 0;
+  u32 indexBytes = 0;
+  u64 vertexHash = 0;
+  u64 indexHash = 0;
+
+  bool operator==(const PortmasterBatchReuseKey& rhs) const noexcept {
+    return prim == rhs.prim && fmt == rhs.fmt && fifoStride == rhs.fifoStride && vertexBytes == rhs.vertexBytes &&
+           indexBytes == rhs.indexBytes && vertexHash == rhs.vertexHash && indexHash == rhs.indexHash;
+  }
+};
+
+struct PortmasterBatchReuseKeyHash {
+  size_t operator()(const PortmasterBatchReuseKey& key) const noexcept {
+    u64 hash = key.vertexHash ^ (key.indexHash + 0x9e3779b97f4a7c15ull + (key.vertexHash << 6) + (key.vertexHash >> 2));
+    hash ^= static_cast<u64>(key.vertexBytes) << 32;
+    hash ^= static_cast<u64>(key.indexBytes);
+    hash ^= static_cast<u64>(key.fifoStride) << 48;
+    hash ^= static_cast<u64>(key.prim) << 8;
+    hash ^= static_cast<u64>(key.fmt);
+    return static_cast<size_t>(hash);
+  }
+};
+
+struct PortmasterBatchReuseEntry {
+  u32 count = 0;
+  u32 lastFrame = 0;
+};
+
+static absl::flat_hash_map<PortmasterBatchReuseKey, PortmasterBatchReuseEntry, PortmasterBatchReuseKeyHash>
+    s_portmasterBatchReuseSeen;
+
+struct PortmasterBatchCacheEntry {
+  gfx::Range vertexRange;
+  gfx::Range indexRange;
+  u32 indexCount = 0;
+};
+
+static absl::flat_hash_map<PortmasterBatchReuseKey, PortmasterBatchCacheEntry, PortmasterBatchReuseKeyHash>
+    s_portmasterBatchCache;
+
+static bool portmaster_batch_reuse_probe_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_BATCH_REUSE_PROBE");
+    return value == nullptr || value[0] == '\0' || value[0] != '0';
+  }();
+  return enabled;
+}
+
+static u64 portmaster_hash_bytes(const u8* data, size_t size) noexcept {
+  if (size == 0) {
+    return 0;
+  }
+  Hasher h;
+  h.update(data, size);
+  return h.digest();
+}
+
+static PortmasterBatchReuseKey portmaster_make_batch_reuse_key(GXPrimitive prim, GXVtxFmt fmt, u32 fifoStride,
+                                                               const ByteBuffer& vertexBytes,
+                                                               const ByteBuffer& indexBytes) noexcept {
+  return PortmasterBatchReuseKey{
+      .prim = prim,
+      .fmt = fmt,
+      .fifoStride = fifoStride,
+      .vertexBytes = static_cast<u32>(vertexBytes.size()),
+      .indexBytes = static_cast<u32>(indexBytes.size()),
+      .vertexHash = portmaster_hash_bytes(vertexBytes.data(), vertexBytes.size()),
+      .indexHash = portmaster_hash_bytes(indexBytes.data(), indexBytes.size()),
+  };
+}
+
+static PortmasterBatchReuseKey portmaster_make_strip_batch_topology_key(GXVtxFmt fmt, u32 fifoStride,
+                                                                        const ByteBuffer& vertexBytes,
+                                                                        const std::vector<u16>& stripCounts) noexcept {
+  return PortmasterBatchReuseKey{
+      .prim = GX_TRIANGLESTRIP,
+      .fmt = fmt,
+      .fifoStride = fifoStride,
+      .vertexBytes = static_cast<u32>(vertexBytes.size()),
+      .indexBytes = static_cast<u32>(stripCounts.size() * sizeof(u16)),
+      .vertexHash = portmaster_hash_bytes(vertexBytes.data(), vertexBytes.size()),
+      .indexHash = portmaster_hash_bytes(reinterpret_cast<const u8*>(stripCounts.data()),
+                                         stripCounts.size() * sizeof(u16)),
+  };
+}
+
+static void portmaster_note_batch_reuse_candidate(GXPrimitive prim, GXVtxFmt fmt, u32 fifoStride,
+                                                  const ByteBuffer& vertexBytes, const ByteBuffer& indexBytes) noexcept {
+  if (!portmaster_batch_reuse_probe_enabled()) {
+    return;
+  }
+  const size_t totalBytes = vertexBytes.size() + indexBytes.size();
+  if (totalBytes < 4096) {
+    return;
+  }
+
+  ++s_portmasterTimingStats.batchReuseCandidates;
+  s_portmasterTimingStats.batchReuseBytes += totalBytes;
+
+  const auto key = portmaster_make_batch_reuse_key(prim, fmt, fifoStride, vertexBytes, indexBytes);
+
+  const u32 frame = gfx::current_frame();
+  auto [it, inserted] = s_portmasterBatchReuseSeen.emplace(key, PortmasterBatchReuseEntry{.count = 1, .lastFrame = frame});
+  if (inserted) {
+    ++s_portmasterTimingStats.batchReuseMisses;
+    if (s_portmasterBatchReuseSeen.size() > 8192) {
+      s_portmasterBatchReuseSeen.clear();
+    }
+    return;
+  }
+
+  if (it->second.lastFrame == frame) {
+    ++s_portmasterTimingStats.batchReuseSameFrameHits;
+  } else {
+    ++s_portmasterTimingStats.batchReuseCrossFrameHits;
+  }
+  ++it->second.count;
+  it->second.lastFrame = frame;
+  ++s_portmasterTimingStats.batchReuseHits;
+  s_portmasterTimingStats.batchReuseAvoidableBytes += totalBytes;
+}
+
+static bool portmaster_batch_reuse_cache_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_BATCH_REUSE_CACHE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+static bool portmaster_find_or_upload_batch_cache(GXPrimitive prim, GXVtxFmt fmt, u32 fifoStride,
+                                                  const ByteBuffer& vertexBytes, const ByteBuffer& indexBytes,
+                                                  gfx::Range& vertexRange, gfx::Range& indexRange) {
+  if (!portmaster_batch_reuse_cache_enabled()) {
+    return false;
+  }
+  const size_t totalBytes = vertexBytes.size() + indexBytes.size();
+  if (totalBytes < 4096) {
+    return false;
+  }
+
+  const auto key = portmaster_make_batch_reuse_key(prim, fmt, fifoStride, vertexBytes, indexBytes);
+  if (auto it = s_portmasterBatchCache.find(key); it != s_portmasterBatchCache.end()) {
+    vertexRange = it->second.vertexRange;
+    indexRange = it->second.indexRange;
+    ++s_portmasterTimingStats.batchCacheHits;
+    return true;
+  }
+
+  ++s_portmasterTimingStats.batchCacheMisses;
+  auto [cachedVertexRange, vertexOk] = gfx::push_portmaster_cached_verts(vertexBytes.data(), vertexBytes.size());
+  auto [cachedIndexRange, indexOk] = gfx::push_portmaster_cached_indices(indexBytes.data(), indexBytes.size());
+  if (!vertexOk || !indexOk) {
+    ++s_portmasterTimingStats.batchCacheFull;
+    return false;
+  }
+
+  vertexRange = cachedVertexRange;
+  indexRange = cachedIndexRange;
+  s_portmasterBatchCache.emplace(key, PortmasterBatchCacheEntry{.vertexRange = vertexRange,
+                                                                .indexRange = indexRange,
+                                                                .indexCount =
+                                                                    static_cast<u32>(indexBytes.size() / sizeof(u16))});
+  ++s_portmasterTimingStats.batchCacheUploads;
+  s_portmasterTimingStats.batchCacheVertexBytes += vertexBytes.size();
+  s_portmasterTimingStats.batchCacheIndexBytes += indexBytes.size();
+  return true;
+}
+
+static bool portmaster_find_or_upload_strip_batch_cache(GXVtxFmt fmt, u32 fifoStride, const ByteBuffer& vertexBytes,
+                                                        const std::vector<u16>& stripCounts,
+                                                        gfx::Range& vertexRange, gfx::Range& indexRange,
+                                                        u32& indexCount) {
+  if (!portmaster_batch_reuse_cache_enabled()) {
+    return false;
+  }
+  const size_t totalBytes = vertexBytes.size() + stripCounts.size() * sizeof(u16);
+  if (totalBytes < 4096) {
+    return false;
+  }
+
+  const auto key = portmaster_make_strip_batch_topology_key(fmt, fifoStride, vertexBytes, stripCounts);
+  if (auto it = s_portmasterBatchCache.find(key); it != s_portmasterBatchCache.end()) {
+    vertexRange = it->second.vertexRange;
+    indexRange = it->second.indexRange;
+    indexCount = it->second.indexCount;
+    ++s_portmasterTimingStats.batchCacheHits;
+    return true;
+  }
+
+  handle_draw_strip_batch_idx_buf.clear();
+  indexCount = build_triangle_strip_batch_topology_indices(handle_draw_strip_batch_idx_buf, stripCounts);
+  ++s_portmasterTimingStats.batchCacheMisses;
+  auto [cachedVertexRange, vertexOk] = gfx::push_portmaster_cached_verts(vertexBytes.data(), vertexBytes.size());
+  auto [cachedIndexRange, indexOk] =
+      gfx::push_portmaster_cached_indices(handle_draw_strip_batch_idx_buf.data(), handle_draw_strip_batch_idx_buf.size());
+  if (!vertexOk || !indexOk) {
+    ++s_portmasterTimingStats.batchCacheFull;
+    return false;
+  }
+
+  vertexRange = cachedVertexRange;
+  indexRange = cachedIndexRange;
+  s_portmasterBatchCache.emplace(
+      key, PortmasterBatchCacheEntry{.vertexRange = vertexRange, .indexRange = indexRange, .indexCount = indexCount});
+  ++s_portmasterTimingStats.batchCacheUploads;
+  s_portmasterTimingStats.batchCacheVertexBytes += vertexBytes.size();
+  s_portmasterTimingStats.batchCacheIndexBytes += handle_draw_strip_batch_idx_buf.size();
+  return true;
+}
+
 static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
   ZoneScoped;
   u8 opcode = cmd & CP_OPCODE_MASK;
@@ -2513,8 +2965,10 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       portmaster_batch_strips_enabled()) {
     handle_draw_strip_batch_vtx_buf.clear();
     handle_draw_strip_batch_idx_buf.clear();
+    static std::vector<u16> stripBatchCounts;
+    stripBatchCounts.clear();
     handle_draw_strip_batch_vtx_buf.append(data + pos, totalVtxBytes);
-    build_triangle_strip_topology_indices(handle_draw_strip_batch_idx_buf, 0, vtxCount, false);
+    stripBatchCounts.push_back(vtxCount);
 
     u32 batchVtxCount = vtxCount;
     u32 batchDraws = 1;
@@ -2530,8 +2984,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
         break;
       }
       handle_draw_strip_batch_vtx_buf.append(data + scan + 3, nextVtxBytes);
-      build_triangle_strip_topology_indices(handle_draw_strip_batch_idx_buf, static_cast<u16>(batchVtxCount),
-                                            nextVtxCount, true);
+      stripBatchCounts.push_back(nextVtxCount);
       batchExtraFifoBytes += nextVtxBytes;
       batchVtxCount += nextVtxCount;
       ++batchDraws;
@@ -2545,20 +2998,30 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       s_portmasterTimingStats.textureVertexDraws += batchDraws;
       portmaster_note_layout_stat(prim, fmt, vtxSize, static_cast<u16>(batchVtxCount), 0,
                                   PortmasterExpandPath::TextureVertex);
-      const gfx::Range vertRange =
-          gfx::push_verts(handle_draw_strip_batch_vtx_buf.data(), handle_draw_strip_batch_vtx_buf.size());
-      const gfx::Range idxRange =
-          gfx::push_indices(handle_draw_strip_batch_idx_buf.data(), handle_draw_strip_batch_idx_buf.size());
-      portmaster_note_indexed_primitive_draw(handle_draw_strip_batch_idx_buf.size());
+      u32 indexCount = 0;
+      gfx::Range vertRange;
+      gfx::Range idxRange;
+      if (!portmaster_find_or_upload_strip_batch_cache(fmt, vtxSize, handle_draw_strip_batch_vtx_buf, stripBatchCounts,
+                                                       vertRange, idxRange, indexCount)) {
+        handle_draw_strip_batch_idx_buf.clear();
+        indexCount = build_triangle_strip_batch_topology_indices(handle_draw_strip_batch_idx_buf, stripBatchCounts);
+        portmaster_note_batch_reuse_candidate(prim, fmt, vtxSize, handle_draw_strip_batch_vtx_buf,
+                                              handle_draw_strip_batch_idx_buf);
+        vertRange = gfx::push_verts(handle_draw_strip_batch_vtx_buf.data(), handle_draw_strip_batch_vtx_buf.size());
+        idxRange = gfx::push_indices(handle_draw_strip_batch_idx_buf.data(), handle_draw_strip_batch_idx_buf.size());
+      }
+      portmaster_note_indexed_primitive_draw(static_cast<size_t>(indexCount) * sizeof(u16));
       handle_draw_unmerged(prim, fmt, static_cast<u16>(batchVtxCount), vertRange, false, nullptr, true, idxRange,
-                           static_cast<u32>(handle_draw_strip_batch_idx_buf.size() / sizeof(u16)));
+                           indexCount);
       handle_draw_strip_batch_vtx_buf.clear();
       handle_draw_strip_batch_idx_buf.clear();
+      stripBatchCounts.clear();
       return;
     }
 
     handle_draw_strip_batch_vtx_buf.clear();
     handle_draw_strip_batch_idx_buf.clear();
+    stripBatchCounts.clear();
   }
 
   if (forceTextureVertexFetch && prim == GX_QUADS && vtxCount >= 4 && (vtxCount % 4) == 0 &&
@@ -2595,12 +3058,17 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
       s_portmasterTimingStats.textureVertexDraws += batchDraws;
       portmaster_note_layout_stat(prim, fmt, vtxSize, static_cast<u16>(batchVtxCount), 0,
                                   PortmasterExpandPath::TextureVertex);
-      const gfx::Range vertRange =
-          gfx::push_verts(handle_draw_quad_batch_vtx_buf.data(), handle_draw_quad_batch_vtx_buf.size());
       const u32 numIndices =
           prepare_idx_buffer(handle_draw_quad_batch_idx_buf, prim, 0, static_cast<u16>(batchVtxCount));
-      const gfx::Range idxRange =
-          gfx::push_indices(handle_draw_quad_batch_idx_buf.data(), handle_draw_quad_batch_idx_buf.size());
+      portmaster_note_batch_reuse_candidate(prim, fmt, vtxSize, handle_draw_quad_batch_vtx_buf,
+                                            handle_draw_quad_batch_idx_buf);
+      gfx::Range vertRange;
+      gfx::Range idxRange;
+      if (!portmaster_find_or_upload_batch_cache(prim, fmt, vtxSize, handle_draw_quad_batch_vtx_buf,
+                                                 handle_draw_quad_batch_idx_buf, vertRange, idxRange)) {
+        vertRange = gfx::push_verts(handle_draw_quad_batch_vtx_buf.data(), handle_draw_quad_batch_vtx_buf.size());
+        idxRange = gfx::push_indices(handle_draw_quad_batch_idx_buf.data(), handle_draw_quad_batch_idx_buf.size());
+      }
       portmaster_note_indexed_primitive_draw(handle_draw_quad_batch_idx_buf.size());
       handle_draw_unmerged(prim, fmt, static_cast<u16>(batchVtxCount), vertRange, false, nullptr, true, idxRange,
                            numIndices);
@@ -2630,6 +3098,20 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
   // Try to merge with previous draw call.
   ++s_portmasterTimingStats.mergeAttempts;
+  if (!g_gxState.stateDirty &&
+      (s_portmasterPendingTevRegMask != 0 || s_portmasterPendingKColorMask != 0)) UNLIKELY {
+    PipelineConfig config{};
+    populate_pipeline_config(config, prim, fmt);
+    config.triangleStripTopology =
+        prim == GX_TRIANGLESTRIP && vtxCount >= 3 && portmaster_strip_topology_enabled() ? 1u : 0u;
+    if (forceTextureVertexFetch) {
+      config.shaderConfig.nativeVertexFetch = false;
+      config.shaderConfig.textureVertexFetch = true;
+      config.shaderConfig.lineMode = 0;
+    }
+    const auto info = build_shader_info(config.shaderConfig);
+    portmaster_resolve_deferred_tev_reg_dirty(info);
+  }
   if (g_gxState.stateDirty) UNLIKELY {
     ++s_portmasterTimingStats.mergeBlockedStateDirty;
     portmaster_note_dirty_merge_block();
@@ -2856,6 +3338,11 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       .triangleStripTopology = config.triangleStripTopology != 0,
   });
   s_portmasterDirtyReasons = 0;
+  s_portmasterBpDirtyReasons = 0;
+  s_portmasterXfDirtyReasons = 0;
+  s_portmasterPendingXfDirtyAddrs = {};
+  s_portmasterPendingTevRegMask = 0;
+  s_portmasterPendingKColorMask = 0;
 }
 
 std::string read_string(const u8* data, u32& pos, u32 size, bool bigEndian) {
@@ -2988,7 +3475,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 4;
     g_gxState.clamp = read_f32(data + pos, bigEndian);
     pos += 4;
-    portmaster_mark_state_dirty(PortmasterDirtyBp);
+    portmaster_mark_bp_dirty(PortmasterBpDirtyRenderState);
   } else if (subCmd == GX_LOAD_AURORA_DESTROY_TEXOBJ) {
     CHECK(pos + 4 <= size, "GX_LOAD_AURORA_DESTROY_TEXOBJ read overrun");
     evict_texture_object(read_u32(data + pos, bigEndian));

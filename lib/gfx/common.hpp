@@ -257,6 +257,8 @@ template <typename T>
 static Range push_indices(ArrayRef<T> data) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T));
 }
+std::pair<Range, bool> push_portmaster_cached_verts(const uint8_t* data, size_t length);
+std::pair<Range, bool> push_portmaster_cached_indices(const uint8_t* data, size_t length);
 Range push_uniform(const uint8_t* data, size_t length);
 template <typename T>
 static Range push_uniform(const T& data) {
