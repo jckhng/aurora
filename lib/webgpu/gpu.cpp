@@ -13,6 +13,7 @@
 #include <aurora/gfx.h>
 #include <magic_enum.hpp>
 #include <webgpu/webgpu_cpp.h>
+#include <SDL3/SDL_video.h>
 
 #include "../gfx/common.hpp"
 #include "../internal.hpp"
@@ -21,6 +22,7 @@
 #ifdef WEBGPU_DAWN
 #include "../dawn/BackendBinding.hpp"
 #include <dawn/native/DawnNative.h>
+#include <dawn/native/OpenGLBackend.h>
 #endif
 
 namespace aurora::gx {
@@ -60,6 +62,72 @@ bool g_bcTexturesSupported;
 bool g_textureComponentSwizzleSupported;
 
 namespace {
+
+constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
+constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
+constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
+
+static SDL_GLContext g_sdl2ShimBootstrapContext = nullptr;
+
+static bool is_sdl2shim_driver() {
+  const char* driver = SDL_GetCurrentVideoDriver();
+  return driver != nullptr && SDL_strcmp(driver, "sdl2") == 0;
+}
+
+static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
+  if (window == nullptr || !is_sdl2shim_driver()) {
+    return false;
+  }
+
+  SDL_PropertiesID props = SDL_GetWindowProperties(window);
+  void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+  void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  if (eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr) {
+    return true;
+  }
+
+  if (g_sdl2ShimBootstrapContext == nullptr) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    g_sdl2ShimBootstrapContext = SDL_GL_CreateContext(window);
+    if (g_sdl2ShimBootstrapContext == nullptr) {
+      Log.error("SDL2-shim EGL bootstrap context creation failed: {}", SDL_GetError());
+      return false;
+    }
+    SDL_GL_SetSwapInterval(0);
+  }
+
+  props = SDL_GetWindowProperties(window);
+  eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+  glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  Log.info("SDL2-shim EGL properties: display={} surface={} getProc={}", eglDisplay, eglSurface, glGetProc);
+  return eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr;
+}
+
+#ifdef WEBGPU_DAWN
+static bool configure_sdl2shim_gl_proc(dawn::native::opengl::RequestAdapterOptionsGetGLProc& glProcOptions) {
+  SDL_Window* window = window::get_sdl_window();
+  if (!ensure_sdl2shim_egl_properties(window)) {
+    return false;
+  }
+
+  SDL_PropertiesID props = SDL_GetWindowProperties(window);
+  void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  if (eglDisplay == nullptr || glGetProc == nullptr) {
+    return false;
+  }
+
+  glProcOptions.getProc = reinterpret_cast<dawn::native::opengl::EGLGetProcProc>(glGetProc);
+  glProcOptions.display = eglDisplay;
+  Log.info("Requesting Dawn OpenGL adapter through SDL2-shim EGL display={} getProc={}", eglDisplay, glGetProc);
+  return true;
+}
+#endif
 
 bool no_surface_mode() noexcept {
   return std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr;
@@ -676,6 +744,7 @@ static bool create_surface() {
     Log.error("Failed to create surface: no window");
     return false;
   }
+  ensure_sdl2shim_egl_properties(window);
   const auto chainedDescriptor = utils::SetupWindowAndGetSurfaceDescriptor(window);
   if (!chainedDescriptor) {
     Log.error("Failed to create surface descriptor for current window");
@@ -733,12 +802,23 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     if (backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) {
       featureLevel = wgpu::FeatureLevel::Compatibility;
     }
+    const wgpu::ChainedStruct* adapterNextInChain = nullptr;
+#ifdef WEBGPU_DAWN
+    dawn::native::opengl::RequestAdapterOptionsGetGLProc glProcOptions;
+    if ((backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) &&
+        configure_sdl2shim_gl_proc(glProcOptions)) {
+      adapterNextInChain = &glProcOptions;
+    }
+#endif
     const wgpu::RequestAdapterOptions options{
+        .nextInChain = adapterNextInChain,
         .featureLevel = featureLevel,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
         .compatibleSurface = std::getenv("DUSKLIGHT_PORTMASTER_SKIP_COMPAT_SURFACE") == nullptr ? g_surface : nullptr,
     };
+    Log.info("Requesting {} adapter: featureLevel={} compatibleSurface={}", magic_enum::enum_name(backend),
+             magic_enum::enum_name(featureLevel), options.compatibleSurface != nullptr ? "yes" : "no");
     const auto future = g_instance.RequestAdapter(
         &options, wgpu::CallbackMode::WaitAnyOnly,
         [](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView message) {

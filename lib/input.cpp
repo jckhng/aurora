@@ -12,6 +12,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <utility>
 
@@ -275,6 +276,40 @@ bool is_instance_claimed(const std::array<Uint32, PAD_MAX_CONTROLLERS>& claimedC
          claimedControllers.begin() + claimedCount;
 }
 
+bool portmaster_auto_assign_first_controller() noexcept {
+  const char* disabled = std::getenv("DUSKLIGHT_PORTMASTER_AUTO_FIRST_CONTROLLER");
+  if (disabled != nullptr && disabled[0] == '0') {
+    return false;
+  }
+  return std::getenv("DUSKLIGHT_PORTMASTER_LOW_SPEC") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") != nullptr;
+}
+
+bool portmaster_input_diag() noexcept {
+  const char* enabled = std::getenv("DUSKLIGHT_PORTMASTER_INPUT_DIAG");
+  return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+void apply_portmaster_gamepad_mapping_override() noexcept {
+  if (!portmaster_auto_assign_first_controller()) {
+    return;
+  }
+
+  const char* mapping = std::getenv("SDL_GAMECONTROLLERCONFIG");
+  if (mapping == nullptr || mapping[0] == '\0') {
+    Log.warn("PortMaster controller mapping override missing; SDL_GAMECONTROLLERCONFIG is empty");
+    return;
+  }
+
+  const int result = SDL_AddGamepadMapping(mapping);
+  if (result < 0) {
+    Log.warn("PortMaster controller mapping override failed: {}", SDL_GetError());
+  } else {
+    Log.info("PortMaster controller mapping override applied result={} mapping='{}'", result, mapping);
+  }
+}
+
 void apply_port_preferences() noexcept {
   ensure_port_preferences_loaded();
   if (!std::any_of(g_portPreferences.begin(), g_portPreferences.end(),
@@ -339,9 +374,8 @@ GameController* get_controller_for_player(uint32_t player) noexcept {
     }
   }
 
-#if 0
-  /* If we don't have a controller assigned to this port use the first unassigned controller */
-  if (!g_GameControllers.empty()) {
+  if (player == 0 && portmaster_auto_assign_first_controller() && !g_GameControllers.empty()) {
+    // PortMaster handhelds often expose a single built-in pad without an SDL player index.
     int32_t availIndex = -1;
     GameController* ct = nullptr;
     for (auto& controller : g_GameControllers) {
@@ -353,10 +387,10 @@ GameController* get_controller_for_player(uint32_t player) noexcept {
     }
     if (availIndex != -1) {
       set_player_index(availIndex, player);
+      Log.info("PortMaster auto-assigned controller instance {} to player {}", availIndex, player);
       return ct;
     }
   }
-#endif
   return nullptr;
 }
 
@@ -393,6 +427,16 @@ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
     controller.m_hasRgbLed = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false);
     SDL_JoystickID instance = SDL_GetJoystickID(SDL_GetGamepadJoystick(ctrl));
     g_GameControllers[instance] = controller;
+    char guid[33] = {};
+    SDL_GUIDToString(SDL_GetGamepadGUIDForID(SDL_GetGamepadID(ctrl)), guid, sizeof(guid));
+    char* mapping = SDL_GetGamepadMapping(ctrl);
+    Log.info("Controller opened: instance={} name='{}' guid={} vid={:04X} pid={:04X} type={} player={} mapping='{}'",
+             instance, SDL_GetGamepadName(ctrl) != nullptr ? SDL_GetGamepadName(ctrl) : "",
+             guid, controller.m_vid, controller.m_pid, static_cast<int>(SDL_GetGamepadType(ctrl)),
+             SDL_GetGamepadPlayerIndex(ctrl), mapping != nullptr ? mapping : "");
+    if (mapping != nullptr) {
+      SDL_free(mapping);
+    }
     apply_port_preferences();
     return instance;
   }
@@ -488,6 +532,10 @@ void initialize() noexcept {
    * as expected */
   ASSERT(SDL_Init(SDL_INIT_HAPTIC | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD | SDL_INIT_SENSOR),
          "Failed to initialize SDL subsystems: {}", SDL_GetError());
+  apply_portmaster_gamepad_mapping_override();
+  if (portmaster_input_diag()) {
+    Log.info("PortMaster input diag enabled");
+  }
 }
 
 struct MouseScrollStatus {

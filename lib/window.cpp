@@ -96,6 +96,12 @@ int positive_env_or(const char* name, int fallback) noexcept {
   return std::max(1, std::atoi(value));
 }
 
+bool portmaster_constrained_render_surface() noexcept {
+  return SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr ||
+         SDL_getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") != nullptr ||
+         SDL_getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
+}
+
 #if defined(SDL_PLATFORM_LINUX)
 bool fbdev_physical_size(int& width, int& height) noexcept {
   int fd = open("/dev/fb0", O_RDONLY, 0);
@@ -463,7 +469,7 @@ AuroraWindowSize get_window_size() {
       fb_h = fitH;
     }
   }
-  if (SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr) {
+  if (portmaster_constrained_render_surface()) {
     const int cappedW = positive_env_or("DUSKLIGHT_PORTMASTER_RENDER_WIDTH", fb_w);
     const int cappedH = positive_env_or("DUSKLIGHT_PORTMASTER_RENDER_HEIGHT", fb_h);
     fb_w = std::min(fb_w, cappedW);

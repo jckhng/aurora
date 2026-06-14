@@ -3,9 +3,12 @@
 #include "../../internal.hpp"
 #include <dolphin/pad.h>
 #include <dolphin/si.h>
+#include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_timer.h>
 
 #include <array>
+#include <cstdlib>
 #include <sys/stat.h>
 #include <ranges>
 
@@ -252,6 +255,60 @@ struct PADKeyboardState {
 };
 
 std::array<PADKeyboardState, PAD_MAX_CONTROLLERS> g_keyboardBindings;
+std::array<PADStatus, PAD_CHANMAX> g_lastPortmasterDiagStatus{};
+std::array<Uint64, PAD_CHANMAX> g_lastPortmasterDiagTick{};
+
+bool portmaster_sdl2shim_input_mode() {
+  return std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") != nullptr;
+}
+
+bool portmaster_input_diag() {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_INPUT_DIAG");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool portmaster_ignore_controller_mapping_files() {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_IGNORE_CONTROLLER_MAPPINGS");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool portmaster_status_active(const PADStatus& status) {
+  return status.button != 0 || status.extButton != 0 || std::abs(status.stickX) > 8 || std::abs(status.stickY) > 8 ||
+         std::abs(status.substickX) > 8 || std::abs(status.substickY) > 8 || status.triggerLeft > 8 ||
+         status.triggerRight > 8;
+}
+
+bool portmaster_status_changed(const PADStatus& lhs, const PADStatus& rhs) {
+  return lhs.button != rhs.button || lhs.extButton != rhs.extButton || lhs.stickX != rhs.stickX ||
+         lhs.stickY != rhs.stickY || lhs.substickX != rhs.substickX || lhs.substickY != rhs.substickY ||
+         lhs.triggerLeft != rhs.triggerLeft || lhs.triggerRight != rhs.triggerRight || lhs.err != rhs.err;
+}
+
+void portmaster_log_pad_diag(u32 port, const PADStatus& status) {
+  if (!portmaster_input_diag() || port != 0) {
+    return;
+  }
+
+  const Uint64 now = SDL_GetTicks();
+  PADStatus& previous = g_lastPortmasterDiagStatus[port];
+  if (!portmaster_status_changed(previous, status)) {
+    return;
+  }
+
+  previous = status;
+  if (!portmaster_status_active(status) && status.err == PAD_ERR_NONE) {
+    return;
+  }
+
+  if (now - g_lastPortmasterDiagTick[port] < 250) {
+    return;
+  }
+
+  g_lastPortmasterDiagTick[port] = now;
+  aurora::input::Log.info("PortMaster PAD diag port={} err={} btn=0x{:04X} ext=0x{:04X} lx={} ly={} rx={} ry={} l={} r={}",
+                          port, status.err, status.button, status.extButton, status.stickX, status.stickY,
+                          status.substickX, status.substickY, status.triggerLeft, status.triggerRight);
+}
 
 struct PADCLampRegion {
   uint8_t minTrigger;
@@ -510,6 +567,12 @@ void __PADLoadMapping(aurora::input::GameController* controller) /*  NOLINT(*-re
 
   controller->m_mappingLoaded = true;
 
+  if (portmaster_ignore_controller_mapping_files()) {
+    aurora::input::Log.info("__PADLoadMapping port={}: using default mapping; PortMaster controller mapping files ignored",
+                            playerIndex);
+    return;
+  }
+
   const auto path = fmt::format("{}/{}_{:04X}_{:04X}.controller", basePath, PADGetName(playerIndex), controller->m_vid,
                                 controller->m_pid);
   SDL_IOStream* file = SDL_IOFromFile(path.c_str(), "rb");
@@ -672,6 +735,10 @@ static void merge_virtual_status(PADStatus& status, const PADStatus& virtualStat
 }
 
 u32 PADRead(PADStatus* status) {
+  if (portmaster_sdl2shim_input_mode()) {
+    SDL_UpdateGamepads();
+  }
+
   if (!g_keyboardBindingsLoaded) {
     g_keyboardBindingsLoaded = true;
     load_keyboard_bindings();
@@ -907,6 +974,8 @@ u32 PADRead(PADStatus* status) {
         merge_virtual_status(status[i], g_virtualPadStatus[i]);
       }
     }
+
+    portmaster_log_pad_diag(i, status[i]);
   }
   return rumbleSupport;
 }

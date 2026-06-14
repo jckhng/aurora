@@ -1,5 +1,7 @@
 #include "BackendBinding.hpp"
 
+#include "../internal.hpp"
+
 #include <cstdlib>
 #include <cstdint>
 #include <fcntl.h>
@@ -16,7 +18,13 @@ namespace aurora::webgpu::utils {
 std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptorCocoa(SDL_Window* window);
 
 namespace {
+Module Log("aurora::dawn");
+
 #if defined(SDL_PLATFORM_LINUX)
+constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
+constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
+constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
+
 struct PortmasterFbdevWindow {
   unsigned short width;
   unsigned short height;
@@ -58,24 +66,67 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
   return std::move(desc);
 #elif defined(SDL_PLATFORM_LINUX)
   if (std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr && init_portmaster_fbdev_window()) {
+    Log.info("Using PortMaster fbdev sentinel Dawn surface: {}x{}", g_portmasterFbdevWindow.width,
+             g_portmasterFbdevWindow.height);
     std::shared_ptr<wgpu::SurfaceSourceXlibWindow> desc = std::make_shared<wgpu::SurfaceSourceXlibWindow>();
     desc->display = nullptr;
     desc->window = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&g_portmasterFbdevWindow));
     return std::move(desc);
   }
   const char* driver = SDL_GetCurrentVideoDriver();
+  if (driver == nullptr) {
+    Log.error("SDL has no current video driver while creating Dawn surface descriptor");
+    return nullptr;
+  }
+  Log.info("Creating Dawn surface descriptor for SDL video driver: {}", driver);
   if (SDL_strcmp(driver, "wayland") == 0) {
     std::shared_ptr<wgpu::SurfaceSourceWaylandSurface> desc = std::make_shared<wgpu::SurfaceSourceWaylandSurface>();
     desc->display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr);
     desc->surface = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr);
+    Log.info("Wayland Dawn surface properties: display={} surface={}", desc->display, desc->surface);
+    if (desc->display == nullptr || desc->surface == nullptr) {
+      Log.error("Wayland SDL driver did not expose display/surface pointers for Dawn");
+      return nullptr;
+    }
     return std::move(desc);
   }
   if (SDL_strcmp(driver, "x11") == 0) {
     std::shared_ptr<wgpu::SurfaceSourceXlibWindow> desc = std::make_shared<wgpu::SurfaceSourceXlibWindow>();
     desc->display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
     desc->window = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+    Log.info("X11 Dawn surface properties: display={} window={}", desc->display, desc->window);
+    if (desc->display == nullptr || desc->window == 0) {
+      Log.error("X11 SDL driver did not expose display/window handles for Dawn");
+      return nullptr;
+    }
     return std::move(desc);
   }
+  if (SDL_strcmp(driver, "sdl2") == 0) {
+    void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+    void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+    void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+    Log.info("SDL2-shim Dawn surface properties: display={} surface={} getProc={}", eglDisplay, eglSurface,
+             glGetProc);
+    if (eglDisplay == nullptr || eglSurface == nullptr || glGetProc == nullptr) {
+      Log.error("SDL2-shim did not expose EGL display/surface/getProc handles for Dawn");
+      return nullptr;
+    }
+    ::setenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE", "1", 1);
+    std::shared_ptr<wgpu::SurfaceSourceXlibWindow> desc = std::make_shared<wgpu::SurfaceSourceXlibWindow>();
+    desc->display = nullptr;
+    desc->window = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(eglSurface));
+    return std::move(desc);
+  }
+  if (SDL_strcmp(driver, "kmsdrm") == 0) {
+    const auto deviceIndex = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_KMSDRM_DEVICE_INDEX_NUMBER, -1);
+    const auto drmFd = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_KMSDRM_DRM_FD_NUMBER, -1);
+    void* gbmDevice = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_KMSDRM_GBM_DEVICE_POINTER, nullptr);
+    Log.info("KMSDRM Dawn surface properties: device_index={} drm_fd={} gbm_device={}", deviceIndex, drmFd,
+             gbmDevice);
+    Log.error("KMSDRM/GBM Dawn surface creation is not implemented in this Dawn binding yet");
+    return nullptr;
+  }
+  Log.error("Unsupported SDL video driver for Dawn surface: {}", driver);
 #endif
   return nullptr;
 #endif

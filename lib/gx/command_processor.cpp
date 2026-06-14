@@ -1953,6 +1953,7 @@ static bool portmaster_no_vertex_storage_mode() {
   static const bool enabled = std::getenv("DUSKLIGHT_PORTMASTER_NO_SURFACE") != nullptr ||
                               std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr ||
                               std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr ||
+                              std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") != nullptr ||
                               std::getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
   return enabled;
 }
