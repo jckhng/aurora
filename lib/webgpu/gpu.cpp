@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
@@ -66,12 +67,31 @@ namespace {
 constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
 constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
 constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
+constexpr const char* SDL2_SHIM_WINDOW_PROP = "SDL.window.sdl2_backend.window";
+constexpr const char* SDL2_SHIM_GL_SWAP_WINDOW_PROP = "SDL.window.sdl2_backend.gl_swap_window";
 
 static SDL_GLContext g_sdl2ShimBootstrapContext = nullptr;
 
 static bool is_sdl2shim_driver() {
   const char* driver = SDL_GetCurrentVideoDriver();
   return driver != nullptr && SDL_strcmp(driver, "sdl2") == 0;
+}
+
+static void set_pointer_env(const char* name, void* pointer) {
+  if (pointer == nullptr) {
+    return;
+  }
+
+  char value[32] = {};
+  std::snprintf(value, sizeof(value), "%p", pointer);
+  ::setenv(name, value, 1);
+}
+
+static void publish_sdl2shim_present_env(SDL_PropertiesID props) {
+  void* sdl2Window = SDL_GetPointerProperty(props, SDL2_SHIM_WINDOW_PROP, nullptr);
+  void* sdl2SwapWindow = SDL_GetPointerProperty(props, SDL2_SHIM_GL_SWAP_WINDOW_PROP, nullptr);
+  set_pointer_env("DUSKLIGHT_PORTMASTER_SDL2SHIM_WINDOW", sdl2Window);
+  set_pointer_env("DUSKLIGHT_PORTMASTER_SDL2SHIM_SWAP_WINDOW", sdl2SwapWindow);
 }
 
 static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
@@ -84,6 +104,7 @@ static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
   void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
   void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
   if (eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr) {
+    publish_sdl2shim_present_env(props);
     return true;
   }
 
@@ -104,7 +125,11 @@ static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
   eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
   eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
   glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
-  Log.info("SDL2-shim EGL properties: display={} surface={} getProc={}", eglDisplay, eglSurface, glGetProc);
+  void* sdl2Window = SDL_GetPointerProperty(props, SDL2_SHIM_WINDOW_PROP, nullptr);
+  void* sdl2SwapWindow = SDL_GetPointerProperty(props, SDL2_SHIM_GL_SWAP_WINDOW_PROP, nullptr);
+  publish_sdl2shim_present_env(props);
+  Log.info("SDL2-shim EGL properties: display={} surface={} getProc={} window={} swapWindow={}", eglDisplay,
+           eglSurface, glGetProc, sdl2Window, sdl2SwapWindow);
   return eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr;
 }
 
