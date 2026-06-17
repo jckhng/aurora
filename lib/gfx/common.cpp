@@ -123,6 +123,7 @@ enum class BufferMapState {
   Mapped,
 };
 static std::atomic s_mappingState{BufferMapState::Unmapped};
+static std::atomic_uint32_t s_mappingAbortWarnings{0};
 static wgpu::Limits g_cachedLimits;
 static uint32_t g_frameIndex = UINT32_MAX;
 static PipelineRef g_currentPipeline;
@@ -863,7 +864,12 @@ void map_staging_buffer() {
       wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
       [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
         if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
-          Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
+          const uint32_t warningCount = s_mappingAbortWarnings.fetch_add(1, std::memory_order_relaxed);
+          if (warningCount < 8) {
+            Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
+          } else if (warningCount == 8) {
+            Log.warn("Further buffer mapping abort warnings suppressed");
+          }
           s_mappingState.store(BufferMapState::Unmapped, std::memory_order_release);
           return;
         }

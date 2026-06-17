@@ -17,6 +17,9 @@
 #include "window.hpp"
 
 #include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_opengles2.h>
+#include <SDL3/SDL_properties.h>
+#include <SDL3/SDL_video.h>
 #include <magic_enum.hpp>
 
 #include "system_info.hpp"
@@ -55,6 +58,7 @@ static bool portmaster_timing_enabled() noexcept {
   return std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") != nullptr ||
          std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr ||
          std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") != nullptr ||
+         std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EXTERNAL_PRESENT") != nullptr ||
          std::getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
 }
 
@@ -393,6 +397,657 @@ void present_after_submit() {
   g_state.readback.Unmap();
 }
 } // namespace portmaster_fbdev
+
+namespace portmaster_sdl_present {
+struct PresenterState {
+  wgpu::Buffer readback;
+  uint32_t readbackWidth = 0;
+  uint32_t readbackHeight = 0;
+  uint32_t readbackStride = 0;
+
+  SDL_GLContext context = nullptr;
+  bool ownsContext = false;
+  void* sdl2Window = nullptr;
+  void* sdl2Context = nullptr;
+  void* sdl2EglDisplay = nullptr;
+  void* sdl2EglSurface = nullptr;
+  bool loggedActive = false;
+  bool loggedContext = false;
+  bool loggedFramebuffer = false;
+  bool loggedGlError = false;
+  bool glReady = false;
+
+  GLuint program = 0;
+  GLuint texture = 0;
+  GLuint vertexBuffer = 0;
+  GLint posLoc = 0;
+  GLint uvLoc = 1;
+  GLint samplerLoc = -1;
+  uint32_t textureWidth = 0;
+  uint32_t textureHeight = 0;
+  std::vector<uint8_t> compactRows;
+};
+
+PresenterState g_sdlState;
+std::atomic_bool g_sdlMapDone{false};
+bool g_sdlMapOk = false;
+
+using Sdl2GlGetProc = void* (*)(const char*);
+using Sdl2GlMakeCurrent = int (*)(void*, void*);
+using Sdl2GlSwapWindow = void (*)(void*);
+using Sdl2EglMakeCurrent = unsigned int (*)(void*, void*, void*, void*);
+
+Sdl2GlGetProc g_sdl2GlGetProc = nullptr;
+Sdl2GlMakeCurrent g_sdl2GlMakeCurrent = nullptr;
+Sdl2GlSwapWindow g_sdl2GlSwapWindow = nullptr;
+Sdl2EglMakeCurrent g_sdl2EglMakeCurrent = nullptr;
+
+using GlActiveTexture = void (*)(GLenum);
+using GlAttachShader = void (*)(GLuint, GLuint);
+using GlBindAttribLocation = void (*)(GLuint, GLuint, const GLchar*);
+using GlBindBuffer = void (*)(GLenum, GLuint);
+using GlBindFramebuffer = void (*)(GLenum, GLuint);
+using GlBindTexture = void (*)(GLenum, GLuint);
+using GlBufferData = void (*)(GLenum, GLsizeiptr, const void*, GLenum);
+using GlCheckFramebufferStatus = GLenum (*)(GLenum);
+using GlClear = void (*)(GLbitfield);
+using GlClearColor = void (*)(GLfloat, GLfloat, GLfloat, GLfloat);
+using GlCompileShader = void (*)(GLuint);
+using GlCreateProgram = GLuint (*)();
+using GlCreateShader = GLuint (*)(GLenum);
+using GlDeleteBuffers = void (*)(GLsizei, const GLuint*);
+using GlDeleteProgram = void (*)(GLuint);
+using GlDeleteShader = void (*)(GLuint);
+using GlDeleteTextures = void (*)(GLsizei, const GLuint*);
+using GlDisable = void (*)(GLenum);
+using GlDrawArrays = void (*)(GLenum, GLint, GLsizei);
+using GlEnableVertexAttribArray = void (*)(GLuint);
+using GlFlush = void (*)();
+using GlGenBuffers = void (*)(GLsizei, GLuint*);
+using GlGenTextures = void (*)(GLsizei, GLuint*);
+using GlGetError = GLenum (*)();
+using GlGetIntegerv = void (*)(GLenum, GLint*);
+using GlGetProgramInfoLog = void (*)(GLuint, GLsizei, GLsizei*, GLchar*);
+using GlGetProgramiv = void (*)(GLuint, GLenum, GLint*);
+using GlGetShaderInfoLog = void (*)(GLuint, GLsizei, GLsizei*, GLchar*);
+using GlGetShaderiv = void (*)(GLuint, GLenum, GLint*);
+using GlGetUniformLocation = GLint (*)(GLuint, const GLchar*);
+using GlLinkProgram = void (*)(GLuint);
+using GlPixelStorei = void (*)(GLenum, GLint);
+using GlShaderSource = void (*)(GLuint, GLsizei, const GLchar* const*, const GLint*);
+using GlTexImage2D = void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
+using GlTexParameteri = void (*)(GLenum, GLenum, GLint);
+using GlTexSubImage2D = void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*);
+using GlUniform1i = void (*)(GLint, GLint);
+using GlUseProgram = void (*)(GLuint);
+using GlVertexAttribPointer = void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
+using GlViewport = void (*)(GLint, GLint, GLsizei, GLsizei);
+
+struct GLFns {
+  GlActiveTexture ActiveTexture = nullptr;
+  GlAttachShader AttachShader = nullptr;
+  GlBindAttribLocation BindAttribLocation = nullptr;
+  GlBindBuffer BindBuffer = nullptr;
+  GlBindFramebuffer BindFramebuffer = nullptr;
+  GlBindTexture BindTexture = nullptr;
+  GlBufferData BufferData = nullptr;
+  GlCheckFramebufferStatus CheckFramebufferStatus = nullptr;
+  GlClear Clear = nullptr;
+  GlClearColor ClearColor = nullptr;
+  GlCompileShader CompileShader = nullptr;
+  GlCreateProgram CreateProgram = nullptr;
+  GlCreateShader CreateShader = nullptr;
+  GlDeleteBuffers DeleteBuffers = nullptr;
+  GlDeleteProgram DeleteProgram = nullptr;
+  GlDeleteShader DeleteShader = nullptr;
+  GlDeleteTextures DeleteTextures = nullptr;
+  GlDisable Disable = nullptr;
+  GlDrawArrays DrawArrays = nullptr;
+  GlEnableVertexAttribArray EnableVertexAttribArray = nullptr;
+  GlFlush Flush = nullptr;
+  GlGenBuffers GenBuffers = nullptr;
+  GlGenTextures GenTextures = nullptr;
+  GlGetError GetError = nullptr;
+  GlGetIntegerv GetIntegerv = nullptr;
+  GlGetProgramInfoLog GetProgramInfoLog = nullptr;
+  GlGetProgramiv GetProgramiv = nullptr;
+  GlGetShaderInfoLog GetShaderInfoLog = nullptr;
+  GlGetShaderiv GetShaderiv = nullptr;
+  GlGetUniformLocation GetUniformLocation = nullptr;
+  GlLinkProgram LinkProgram = nullptr;
+  GlPixelStorei PixelStorei = nullptr;
+  GlShaderSource ShaderSource = nullptr;
+  GlTexImage2D TexImage2D = nullptr;
+  GlTexParameteri TexParameteri = nullptr;
+  GlTexSubImage2D TexSubImage2D = nullptr;
+  GlUniform1i Uniform1i = nullptr;
+  GlUseProgram UseProgram = nullptr;
+  GlVertexAttribPointer VertexAttribPointer = nullptr;
+  GlViewport Viewport = nullptr;
+};
+
+GLFns gl;
+bool g_loadedFns = false;
+
+bool enabled() noexcept { return std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EXTERNAL_PRESENT") != nullptr; }
+
+uint32_t present_interval() noexcept {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_PRESENT_INTERVAL");
+  if (value == nullptr || value[0] == '\0') {
+    return 1;
+  }
+  return std::max(1, std::atoi(value));
+}
+
+bool should_present_frame() noexcept {
+  if (!enabled()) {
+    return false;
+  }
+  const uint32_t frame = gfx::current_frame();
+  if (frame == UINT32_MAX) {
+    return true;
+  }
+  return (frame % present_interval()) == 0;
+}
+
+const char* gl_error_name(GLenum error) noexcept {
+  switch (error) {
+  case GL_NO_ERROR:
+    return "GL_NO_ERROR";
+  case GL_INVALID_ENUM:
+    return "GL_INVALID_ENUM";
+  case GL_INVALID_VALUE:
+    return "GL_INVALID_VALUE";
+  case GL_INVALID_OPERATION:
+    return "GL_INVALID_OPERATION";
+  case GL_INVALID_FRAMEBUFFER_OPERATION:
+    return "GL_INVALID_FRAMEBUFFER_OPERATION";
+  case GL_OUT_OF_MEMORY:
+    return "GL_OUT_OF_MEMORY";
+  default:
+    return "GL_UNKNOWN_ERROR";
+  }
+}
+
+const char* framebuffer_status_name(GLenum status) noexcept {
+  switch (status) {
+  case GL_FRAMEBUFFER_COMPLETE:
+    return "GL_FRAMEBUFFER_COMPLETE";
+  case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT:
+    return "GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT";
+  case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:
+    return "GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT";
+  case GL_FRAMEBUFFER_UNSUPPORTED:
+    return "GL_FRAMEBUFFER_UNSUPPORTED";
+  case 0x8219:
+    return "GL_FRAMEBUFFER_UNDEFINED";
+  default:
+    return "GL_FRAMEBUFFER_UNKNOWN_STATUS";
+  }
+}
+
+void clear_gl_errors(const char* stage) {
+  if (gl.GetError == nullptr) {
+    return;
+  }
+  bool sawError = false;
+  for (uint32_t i = 0; i < 16; ++i) {
+    const GLenum error = gl.GetError();
+    if (error == GL_NO_ERROR) {
+      if (sawError) {
+        g_sdlState.loggedGlError = true;
+      }
+      return;
+    }
+    sawError = true;
+    if (!g_sdlState.loggedGlError) {
+      Log.warn("PortMaster SDL presenter GL error at {}: {} ({:#x})", stage, gl_error_name(error),
+               static_cast<uint32_t>(error));
+    }
+  }
+  if (!g_sdlState.loggedGlError) {
+    Log.warn("PortMaster SDL presenter GL error drain stopped at {}", stage);
+  }
+  g_sdlState.loggedGlError = true;
+}
+
+template <typename Fn>
+bool load_gl_proc(Fn& out, const char* name) {
+  if (g_sdl2GlGetProc != nullptr) {
+    out = reinterpret_cast<Fn>(g_sdl2GlGetProc(name));
+  } else {
+    out = reinterpret_cast<Fn>(SDL_GL_GetProcAddress(name));
+  }
+  if (out == nullptr) {
+    Log.warn("PortMaster SDL presenter missing GL proc {}", name);
+    return false;
+  }
+  return true;
+}
+
+bool load_sdl2shim_present_hooks(SDL_Window* sdlWindow) {
+  SDL_PropertiesID props = SDL_GetWindowProperties(sdlWindow);
+  g_sdlState.sdl2Window = SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.window", nullptr);
+  g_sdlState.sdl2Context = SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.context", nullptr);
+  g_sdlState.sdl2EglDisplay = SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.egl_display", nullptr);
+  g_sdlState.sdl2EglSurface = SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.egl_surface", nullptr);
+  g_sdl2GlGetProc = reinterpret_cast<Sdl2GlGetProc>(
+      SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.gl_get_proc", nullptr));
+  g_sdl2GlMakeCurrent = reinterpret_cast<Sdl2GlMakeCurrent>(
+      SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.gl_make_current", nullptr));
+  g_sdl2GlSwapWindow = reinterpret_cast<Sdl2GlSwapWindow>(
+      SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.gl_swap_window", nullptr));
+  g_sdl2EglMakeCurrent = reinterpret_cast<Sdl2EglMakeCurrent>(
+      SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.egl_make_current", nullptr));
+
+  return g_sdlState.sdl2Window != nullptr && g_sdlState.sdl2Context != nullptr &&
+         g_sdl2GlGetProc != nullptr && g_sdl2GlMakeCurrent != nullptr && g_sdl2GlSwapWindow != nullptr;
+}
+
+bool load_gl_functions() {
+  if (g_loadedFns) {
+    return true;
+  }
+  bool ok = true;
+  ok &= load_gl_proc(gl.ActiveTexture, "glActiveTexture");
+  ok &= load_gl_proc(gl.AttachShader, "glAttachShader");
+  ok &= load_gl_proc(gl.BindAttribLocation, "glBindAttribLocation");
+  ok &= load_gl_proc(gl.BindBuffer, "glBindBuffer");
+  ok &= load_gl_proc(gl.BindFramebuffer, "glBindFramebuffer");
+  ok &= load_gl_proc(gl.BindTexture, "glBindTexture");
+  ok &= load_gl_proc(gl.BufferData, "glBufferData");
+  ok &= load_gl_proc(gl.CheckFramebufferStatus, "glCheckFramebufferStatus");
+  ok &= load_gl_proc(gl.Clear, "glClear");
+  ok &= load_gl_proc(gl.ClearColor, "glClearColor");
+  ok &= load_gl_proc(gl.CompileShader, "glCompileShader");
+  ok &= load_gl_proc(gl.CreateProgram, "glCreateProgram");
+  ok &= load_gl_proc(gl.CreateShader, "glCreateShader");
+  ok &= load_gl_proc(gl.DeleteBuffers, "glDeleteBuffers");
+  ok &= load_gl_proc(gl.DeleteProgram, "glDeleteProgram");
+  ok &= load_gl_proc(gl.DeleteShader, "glDeleteShader");
+  ok &= load_gl_proc(gl.DeleteTextures, "glDeleteTextures");
+  ok &= load_gl_proc(gl.Disable, "glDisable");
+  ok &= load_gl_proc(gl.DrawArrays, "glDrawArrays");
+  ok &= load_gl_proc(gl.EnableVertexAttribArray, "glEnableVertexAttribArray");
+  ok &= load_gl_proc(gl.Flush, "glFlush");
+  ok &= load_gl_proc(gl.GenBuffers, "glGenBuffers");
+  ok &= load_gl_proc(gl.GenTextures, "glGenTextures");
+  ok &= load_gl_proc(gl.GetError, "glGetError");
+  ok &= load_gl_proc(gl.GetIntegerv, "glGetIntegerv");
+  ok &= load_gl_proc(gl.GetProgramInfoLog, "glGetProgramInfoLog");
+  ok &= load_gl_proc(gl.GetProgramiv, "glGetProgramiv");
+  ok &= load_gl_proc(gl.GetShaderInfoLog, "glGetShaderInfoLog");
+  ok &= load_gl_proc(gl.GetShaderiv, "glGetShaderiv");
+  ok &= load_gl_proc(gl.GetUniformLocation, "glGetUniformLocation");
+  ok &= load_gl_proc(gl.LinkProgram, "glLinkProgram");
+  ok &= load_gl_proc(gl.PixelStorei, "glPixelStorei");
+  ok &= load_gl_proc(gl.ShaderSource, "glShaderSource");
+  ok &= load_gl_proc(gl.TexImage2D, "glTexImage2D");
+  ok &= load_gl_proc(gl.TexParameteri, "glTexParameteri");
+  ok &= load_gl_proc(gl.TexSubImage2D, "glTexSubImage2D");
+  ok &= load_gl_proc(gl.Uniform1i, "glUniform1i");
+  ok &= load_gl_proc(gl.UseProgram, "glUseProgram");
+  ok &= load_gl_proc(gl.VertexAttribPointer, "glVertexAttribPointer");
+  ok &= load_gl_proc(gl.Viewport, "glViewport");
+  g_loadedFns = ok;
+  return ok;
+}
+
+GLuint compile_shader(GLenum type, const char* source) {
+  const GLuint shader = gl.CreateShader(type);
+  gl.ShaderSource(shader, 1, &source, nullptr);
+  gl.CompileShader(shader);
+  GLint compiled = GL_FALSE;
+  gl.GetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (compiled == GL_TRUE) {
+    return shader;
+  }
+  char log[512] = {};
+  GLsizei len = 0;
+  gl.GetShaderInfoLog(shader, sizeof(log), &len, log);
+  Log.warn("PortMaster SDL presenter shader compile failed: {}", log);
+  gl.DeleteShader(shader);
+  return 0;
+}
+
+bool ensure_program() {
+  if (g_sdlState.glReady) {
+    return true;
+  }
+  if (!load_gl_functions()) {
+    return false;
+  }
+  constexpr const char* vertexSource = R"(
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  v_uv = a_uv;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+)";
+  constexpr const char* fragmentSource = R"(
+precision mediump float;
+varying vec2 v_uv;
+uniform sampler2D u_tex;
+void main() {
+  gl_FragColor = texture2D(u_tex, v_uv);
+}
+)";
+  const GLuint vs = compile_shader(GL_VERTEX_SHADER, vertexSource);
+  const GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fragmentSource);
+  if (vs == 0 || fs == 0) {
+    if (vs != 0) {
+      gl.DeleteShader(vs);
+    }
+    if (fs != 0) {
+      gl.DeleteShader(fs);
+    }
+    return false;
+  }
+  g_sdlState.program = gl.CreateProgram();
+  gl.AttachShader(g_sdlState.program, vs);
+  gl.AttachShader(g_sdlState.program, fs);
+  gl.BindAttribLocation(g_sdlState.program, 0, "a_pos");
+  gl.BindAttribLocation(g_sdlState.program, 1, "a_uv");
+  gl.LinkProgram(g_sdlState.program);
+  gl.DeleteShader(vs);
+  gl.DeleteShader(fs);
+  GLint linked = GL_FALSE;
+  gl.GetProgramiv(g_sdlState.program, GL_LINK_STATUS, &linked);
+  if (linked != GL_TRUE) {
+    char log[512] = {};
+    GLsizei len = 0;
+    gl.GetProgramInfoLog(g_sdlState.program, sizeof(log), &len, log);
+    Log.warn("PortMaster SDL presenter program link failed: {}", log);
+    gl.DeleteProgram(g_sdlState.program);
+    g_sdlState.program = 0;
+    return false;
+  }
+  g_sdlState.samplerLoc = gl.GetUniformLocation(g_sdlState.program, "u_tex");
+  gl.GenTextures(1, &g_sdlState.texture);
+  gl.BindTexture(GL_TEXTURE_2D, g_sdlState.texture);
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  constexpr float vertices[] = {
+      -1.f, -1.f, 0.f, 1.f,
+       1.f, -1.f, 1.f, 1.f,
+      -1.f,  1.f, 0.f, 0.f,
+       1.f,  1.f, 1.f, 0.f,
+  };
+  gl.GenBuffers(1, &g_sdlState.vertexBuffer);
+  gl.BindBuffer(GL_ARRAY_BUFFER, g_sdlState.vertexBuffer);
+  gl.BufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+  g_sdlState.glReady = true;
+  return true;
+}
+
+bool ensure_context() {
+  SDL_Window* sdlWindow = window::get_sdl_window();
+  if (sdlWindow == nullptr) {
+    return false;
+  }
+  if (g_sdlState.context == nullptr) {
+    if (load_sdl2shim_present_hooks(sdlWindow)) {
+      g_sdlState.context = static_cast<SDL_GLContext>(g_sdlState.sdl2Context);
+      g_sdlState.ownsContext = false;
+    } else {
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+      SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+      g_sdlState.context = SDL_GL_CreateContext(sdlWindow);
+      g_sdlState.ownsContext = g_sdlState.context != nullptr;
+    }
+  }
+  if (g_sdlState.context == nullptr) {
+    Log.warn("PortMaster SDL presenter has no GL context: {}", SDL_GetError());
+    return false;
+  }
+  if (g_sdl2GlMakeCurrent != nullptr && g_sdlState.sdl2Window != nullptr && g_sdlState.sdl2Context != nullptr) {
+    if (g_sdl2GlMakeCurrent(g_sdlState.sdl2Window, g_sdlState.sdl2Context) != 0) {
+      Log.warn("PortMaster SDL presenter SDL2 MakeCurrent failed");
+      return false;
+    }
+    if (g_sdl2EglMakeCurrent != nullptr && g_sdlState.sdl2EglDisplay != nullptr &&
+        g_sdlState.sdl2EglSurface != nullptr) {
+      if (g_sdl2EglMakeCurrent(g_sdlState.sdl2EglDisplay, g_sdlState.sdl2EglSurface,
+                               g_sdlState.sdl2EglSurface, g_sdlState.sdl2Context) == 0) {
+        Log.warn("PortMaster SDL presenter eglMakeCurrent failed");
+        return false;
+      }
+    }
+  } else {
+    if (!SDL_GL_MakeCurrent(sdlWindow, g_sdlState.context)) {
+      Log.warn("PortMaster SDL presenter MakeCurrent failed: {}", SDL_GetError());
+      return false;
+    }
+  }
+  if (!g_sdlState.loggedActive) {
+    Log.warn("PortMaster SDL2-shim external presenter active");
+    g_sdlState.loggedActive = true;
+  }
+  if (!ensure_program()) {
+    return false;
+  }
+  clear_gl_errors("context-ready");
+  if (!g_sdlState.loggedContext) {
+    int winW = 0;
+    int winH = 0;
+    int pixelW = 0;
+    int pixelH = 0;
+    SDL_GetWindowSize(sdlWindow, &winW, &winH);
+    SDL_GetWindowSizeInPixels(sdlWindow, &pixelW, &pixelH);
+    GLint viewport[4] = {};
+    GLint framebuffer = 0;
+    gl.GetIntegerv(GL_VIEWPORT, viewport);
+    gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+    const GLenum status = gl.CheckFramebufferStatus(GL_FRAMEBUFFER);
+    Log.warn("PortMaster SDL presenter context={} owns={} sdl2Window={} sdl2Context={} eglDisplay={} eglSurface={} "
+             "sdl2MakeCurrent={} eglMakeCurrent={} sdl2Swap={} currentWindow={} currentContext={} "
+             "window={}x{} pixels={}x{} viewport={}x{}+{},{} "
+             "framebuffer={} status={} ({:#x})",
+             static_cast<const void*>(g_sdlState.context), g_sdlState.ownsContext,
+             g_sdlState.sdl2Window, g_sdlState.sdl2Context, g_sdlState.sdl2EglDisplay, g_sdlState.sdl2EglSurface,
+             reinterpret_cast<const void*>(g_sdl2GlMakeCurrent), reinterpret_cast<const void*>(g_sdl2EglMakeCurrent),
+             reinterpret_cast<const void*>(g_sdl2GlSwapWindow),
+             static_cast<const void*>(SDL_GL_GetCurrentWindow()), static_cast<const void*>(SDL_GL_GetCurrentContext()), winW,
+             winH, pixelW, pixelH, viewport[2], viewport[3], viewport[0], viewport[1], framebuffer,
+             framebuffer_status_name(status), static_cast<uint32_t>(status));
+    g_sdlState.loggedContext = true;
+  }
+  return true;
+}
+
+void shutdown() {
+  if (g_sdlState.context != nullptr && window::get_sdl_window() != nullptr) {
+    if (g_sdl2GlMakeCurrent != nullptr && g_sdlState.sdl2Window != nullptr && g_sdlState.sdl2Context != nullptr) {
+      g_sdl2GlMakeCurrent(g_sdlState.sdl2Window, g_sdlState.sdl2Context);
+      if (g_sdl2EglMakeCurrent != nullptr && g_sdlState.sdl2EglDisplay != nullptr &&
+          g_sdlState.sdl2EglSurface != nullptr) {
+        g_sdl2EglMakeCurrent(g_sdlState.sdl2EglDisplay, g_sdlState.sdl2EglSurface,
+                             g_sdlState.sdl2EglSurface, g_sdlState.sdl2Context);
+      }
+    } else {
+      SDL_GL_MakeCurrent(window::get_sdl_window(), g_sdlState.context);
+    }
+  }
+  if (g_sdlState.texture != 0 && gl.DeleteTextures != nullptr) {
+    gl.DeleteTextures(1, &g_sdlState.texture);
+  }
+  if (g_sdlState.vertexBuffer != 0 && gl.DeleteBuffers != nullptr) {
+    gl.DeleteBuffers(1, &g_sdlState.vertexBuffer);
+  }
+  if (g_sdlState.program != 0 && gl.DeleteProgram != nullptr) {
+    gl.DeleteProgram(g_sdlState.program);
+  }
+  if (g_sdlState.context != nullptr && g_sdlState.ownsContext) {
+    SDL_GL_DestroyContext(g_sdlState.context);
+  }
+  g_sdlState = {};
+  g_loadedFns = false;
+  g_sdl2GlGetProc = nullptr;
+  g_sdl2GlMakeCurrent = nullptr;
+  g_sdl2GlSwapWindow = nullptr;
+  g_sdl2EglMakeCurrent = nullptr;
+  gl = {};
+}
+
+bool ensure_readback(uint32_t width, uint32_t height) {
+  const uint32_t stride = AURORA_ALIGN(width * 4u, 256u);
+  if (g_sdlState.readback && g_sdlState.readbackWidth == width && g_sdlState.readbackHeight == height &&
+      g_sdlState.readbackStride == stride) {
+    return true;
+  }
+  const wgpu::BufferDescriptor descriptor{
+      .label = "PortMaster SDL presenter readback",
+      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
+      .size = static_cast<uint64_t>(stride) * height,
+  };
+  g_sdlState.readback = g_device.CreateBuffer(&descriptor);
+  g_sdlState.readbackWidth = width;
+  g_sdlState.readbackHeight = height;
+  g_sdlState.readbackStride = stride;
+  return g_sdlState.readback != nullptr;
+}
+
+void enqueue_readback(const wgpu::CommandEncoder& encoder, const webgpu::TextureWithSampler& source) {
+  if (!enabled() || !source.texture || source.size.width == 0 || source.size.height == 0 ||
+      !ensure_readback(source.size.width, source.size.height)) {
+    return;
+  }
+  const wgpu::TexelCopyTextureInfo src{
+      .texture = source.texture,
+  };
+  const wgpu::TexelCopyBufferInfo dst{
+      .layout =
+          wgpu::TexelCopyBufferLayout{
+              .bytesPerRow = g_sdlState.readbackStride,
+              .rowsPerImage = source.size.height,
+          },
+      .buffer = g_sdlState.readback,
+  };
+  const wgpu::Extent3D size{
+      .width = source.size.width,
+      .height = source.size.height,
+      .depthOrArrayLayers = 1,
+  };
+  encoder.CopyTextureToBuffer(&src, &dst, &size);
+}
+
+const uint8_t* compact_readback_rows(const uint8_t* data) {
+  const uint32_t compactStride = g_sdlState.readbackWidth * 4u;
+  if (g_sdlState.readbackStride == compactStride) {
+    return data;
+  }
+  g_sdlState.compactRows.resize(static_cast<size_t>(compactStride) * g_sdlState.readbackHeight);
+  for (uint32_t y = 0; y < g_sdlState.readbackHeight; ++y) {
+    std::memcpy(g_sdlState.compactRows.data() + static_cast<size_t>(y) * compactStride,
+                data + static_cast<size_t>(y) * g_sdlState.readbackStride, compactStride);
+  }
+  return g_sdlState.compactRows.data();
+}
+
+bool draw_pixels(const uint8_t* data) {
+  const uint32_t width = g_sdlState.readbackWidth;
+  const uint32_t height = g_sdlState.readbackHeight;
+  const uint8_t* pixels = compact_readback_rows(data);
+  clear_gl_errors("before-present-draw");
+  gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+  const GLenum framebufferStatus = gl.CheckFramebufferStatus(GL_FRAMEBUFFER);
+  if (framebufferStatus != GL_FRAMEBUFFER_COMPLETE) {
+    if (!g_sdlState.loggedFramebuffer) {
+      Log.warn("PortMaster SDL presenter default framebuffer is not complete: {} ({:#x})",
+               framebuffer_status_name(framebufferStatus), static_cast<uint32_t>(framebufferStatus));
+      g_sdlState.loggedFramebuffer = true;
+    }
+    clear_gl_errors("incomplete-framebuffer");
+    return false;
+  }
+  if (g_sdlState.textureWidth != width || g_sdlState.textureHeight != height) {
+    gl.BindTexture(GL_TEXTURE_2D, g_sdlState.texture);
+    gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA,
+                  GL_UNSIGNED_BYTE, pixels);
+    g_sdlState.textureWidth = width;
+    g_sdlState.textureHeight = height;
+  } else {
+    gl.BindTexture(GL_TEXTURE_2D, g_sdlState.texture);
+    gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA,
+                     GL_UNSIGNED_BYTE, pixels);
+  }
+
+  const auto size = window::get_window_size();
+  gl.Viewport(0, 0, static_cast<GLsizei>(size.native_fb_width), static_cast<GLsizei>(size.native_fb_height));
+  gl.Disable(GL_DEPTH_TEST);
+  gl.Disable(GL_SCISSOR_TEST);
+  gl.ClearColor(0.f, 0.f, 0.f, 1.f);
+  gl.Clear(GL_COLOR_BUFFER_BIT);
+  gl.UseProgram(g_sdlState.program);
+  gl.ActiveTexture(GL_TEXTURE0);
+  gl.BindTexture(GL_TEXTURE_2D, g_sdlState.texture);
+  if (g_sdlState.samplerLoc >= 0) {
+    gl.Uniform1i(g_sdlState.samplerLoc, 0);
+  }
+  gl.BindBuffer(GL_ARRAY_BUFFER, g_sdlState.vertexBuffer);
+  gl.EnableVertexAttribArray(0);
+  gl.EnableVertexAttribArray(1);
+  gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), nullptr);
+  gl.VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), reinterpret_cast<const void*>(2 * sizeof(float)));
+  gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  if (gl.Flush != nullptr) {
+    gl.Flush();
+  }
+  clear_gl_errors("after-present-draw");
+  return true;
+}
+
+void present_after_submit() {
+  if (!enabled() || !g_sdlState.readback) {
+    return;
+  }
+  const uint64_t byteSize = static_cast<uint64_t>(g_sdlState.readbackStride) * g_sdlState.readbackHeight;
+  g_sdlMapDone.store(false, std::memory_order_release);
+  g_sdlMapOk = false;
+  const auto mapStart = Clock::now();
+  const auto future = g_sdlState.readback.MapAsync(
+      wgpu::MapMode::Read, 0, byteSize, wgpu::CallbackMode::WaitAnyOnly,
+      [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
+        if (status != wgpu::MapAsyncStatus::Success) {
+          Log.warn("PortMaster SDL presenter readback map failed: {} {}", magic_enum::enum_name(status), message);
+        }
+        g_sdlMapOk = status == wgpu::MapAsyncStatus::Success;
+        g_sdlMapDone.store(true, std::memory_order_release);
+      });
+  const auto mapQueued = Clock::now();
+  const auto status = webgpu::g_instance.WaitAny(future, 1000000000);
+  const auto waitDone = Clock::now();
+  if (status != wgpu::WaitStatus::Success || !g_sdlMapDone.load(std::memory_order_acquire) || !g_sdlMapOk) {
+    Log.warn("PortMaster SDL presenter readback wait failed: {}", magic_enum::enum_name(status));
+    return;
+  }
+  const auto* data = static_cast<const uint8_t*>(g_sdlState.readback.GetConstMappedRange(0, byteSize));
+  const auto drawStart = Clock::now();
+  if (data != nullptr && ensure_context()) {
+    if (draw_pixels(data)) {
+      if (g_sdl2GlSwapWindow != nullptr && g_sdlState.sdl2Window != nullptr) {
+        g_sdl2GlSwapWindow(g_sdlState.sdl2Window);
+      } else if (!SDL_GL_SwapWindow(window::get_sdl_window())) {
+        Log.warn("PortMaster SDL presenter SwapWindow failed: {}", SDL_GetError());
+      }
+    }
+    clear_gl_errors("after-swap");
+  }
+  const auto drawDone = Clock::now();
+  portmaster_fbdev::note_fbdev_timing(elapsed_us(mapStart, mapQueued), elapsed_us(mapQueued, waitDone),
+                                      elapsed_us(drawStart, drawDone));
+  g_sdlState.readback.Unmap();
+}
+} // namespace portmaster_sdl_present
 #endif
 
 #ifdef AURORA_ENABLE_GX
@@ -546,8 +1201,9 @@ void shutdown() noexcept {
   g_currentView = {};
   imgui::shutdown();
   gfx::shutdown();
-  webgpu::shutdown();
+  portmaster_sdl_present::shutdown();
   portmaster_fbdev::shutdown();
+  webgpu::shutdown();
 #endif
   input::shutdown();
   window::shutdown();
@@ -565,7 +1221,7 @@ const AuroraEvent* update() noexcept {
 bool begin_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
-  if (portmaster_fbdev::enabled()) {
+  if (portmaster_fbdev::enabled() || portmaster_sdl_present::enabled()) {
     imgui::new_frame(window::get_window_size());
     if (!gfx::begin_frame()) {
       g_currentView = {};
@@ -628,6 +1284,9 @@ void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   const bool fbdevPresentThisFrame = portmaster_fbdev::should_present_frame();
+  const bool sdlPresentThisFrame = portmaster_sdl_present::should_present_frame();
+  const bool externalPresentThisFrame = fbdevPresentThisFrame || sdlPresentThisFrame;
+  const bool externalPresenterEnabled = portmaster_fbdev::enabled() || portmaster_sdl_present::enabled();
   const auto frameStart = Clock::now();
   const auto drainStart = frameStart;
   gx::fifo::drain();
@@ -699,11 +1358,11 @@ void end_frame() noexcept {
         imgui::render(pass);
         pass.End();
       }
-    } else if (!portmaster_fbdev::enabled()) {
+    } else if (!externalPresenterEnabled) {
       Log.info("Skipping present; window not presentable");
       webgpu::release_surface();
     }
-    if (fbdevPresentThisFrame) {
+    if (externalPresentThisFrame) {
       const auto& presentSource = webgpu::present_source();
       const webgpu::TextureWithSampler* readbackSource = &presentSource;
     #if AURORA_ENABLE_RMLUI
@@ -717,7 +1376,12 @@ void end_frame() noexcept {
         }
       }
     #endif
-      portmaster_fbdev::enqueue_readback(encoder, *readbackSource);
+      if (fbdevPresentThisFrame) {
+        portmaster_fbdev::enqueue_readback(encoder, *readbackSource);
+      }
+      if (sdlPresentThisFrame) {
+        portmaster_sdl_present::enqueue_readback(encoder, *readbackSource);
+      }
     }
     const auto renderDone = Clock::now();
     const auto finishSubmitStart = Clock::now();
@@ -731,6 +1395,9 @@ void end_frame() noexcept {
     const auto fbdevStart = Clock::now();
     if (fbdevPresentThisFrame) {
       portmaster_fbdev::present_after_submit();
+    }
+    if (sdlPresentThisFrame) {
+      portmaster_sdl_present::present_after_submit();
     }
     const auto fbdevDone = Clock::now();
     if (window::is_presentable() && g_surface) {
