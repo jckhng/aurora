@@ -3,6 +3,7 @@
 #include "../internal.hpp"
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstdint>
 #include <fcntl.h>
 #include <linux/fb.h>
@@ -24,6 +25,28 @@ Module Log("aurora::dawn");
 constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
 constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
 constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
+constexpr const char* SDL2_SHIM_WINDOW_PROP = "SDL.window.sdl2_backend.window";
+constexpr const char* SDL2_SHIM_CONTEXT_PROP = "SDL.window.sdl2_backend.context";
+constexpr const char* SDL2_SHIM_GL_MAKE_CURRENT_PROP = "SDL.window.sdl2_backend.gl_make_current";
+constexpr const char* SDL2_SHIM_GL_SWAP_WINDOW_PROP = "SDL.window.sdl2_backend.gl_swap_window";
+constexpr const char* SDL2_SHIM_EGL_MAKE_CURRENT_PROP = "SDL.window.sdl2_backend.egl_make_current";
+
+struct PortmasterSdl2ShimEglSurface {
+  uint32_t magic;
+  uint32_t version;
+  void* eglDisplay;
+  void* eglSurface;
+  void* sdl2Window;
+  void* sdl2Context;
+  void* glGetProc;
+  void* glMakeCurrent;
+  void* glSwapWindow;
+  void* eglMakeCurrent;
+};
+
+constexpr uint32_t PortmasterSdl2ShimEglSurfaceMagic = 0x44533245; // DS2E
+constexpr uint32_t PortmasterSdl2ShimEglSurfaceVersion = 1;
+PortmasterSdl2ShimEglSurface g_portmasterSdl2ShimSurface{};
 
 struct PortmasterFbdevWindow {
   unsigned short width;
@@ -105,16 +128,40 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
     void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
     void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
     void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
-    Log.info("SDL2-shim Dawn surface properties: display={} surface={} getProc={}", eglDisplay, eglSurface,
-             glGetProc);
-    if (eglDisplay == nullptr || eglSurface == nullptr || glGetProc == nullptr) {
-      Log.error("SDL2-shim did not expose EGL display/surface/getProc handles for Dawn");
+    void* sdl2Window = SDL_GetPointerProperty(props, SDL2_SHIM_WINDOW_PROP, nullptr);
+    void* sdl2Context = SDL_GetPointerProperty(props, SDL2_SHIM_CONTEXT_PROP, nullptr);
+    void* glMakeCurrent = SDL_GetPointerProperty(props, SDL2_SHIM_GL_MAKE_CURRENT_PROP, nullptr);
+    void* glSwapWindow = SDL_GetPointerProperty(props, SDL2_SHIM_GL_SWAP_WINDOW_PROP, nullptr);
+    void* eglMakeCurrent = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_MAKE_CURRENT_PROP, nullptr);
+    Log.info("SDL2-shim Dawn surface properties: display={} surface={} getProc={} window={} context={} "
+             "makeCurrent={} swapWindow={} eglMakeCurrent={} table={}",
+             eglDisplay, eglSurface, glGetProc, sdl2Window, sdl2Context, glMakeCurrent, glSwapWindow,
+             eglMakeCurrent, static_cast<void*>(&g_portmasterSdl2ShimSurface));
+    if (eglDisplay == nullptr || eglSurface == nullptr || glGetProc == nullptr || sdl2Window == nullptr ||
+        sdl2Context == nullptr || glMakeCurrent == nullptr || glSwapWindow == nullptr) {
+      Log.error("SDL2-shim did not expose enough EGL/context handles for Dawn");
       return nullptr;
     }
     ::setenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE", "1", 1);
+    g_portmasterSdl2ShimSurface = {
+        .magic = PortmasterSdl2ShimEglSurfaceMagic,
+        .version = PortmasterSdl2ShimEglSurfaceVersion,
+        .eglDisplay = eglDisplay,
+        .eglSurface = eglSurface,
+        .sdl2Window = sdl2Window,
+        .sdl2Context = sdl2Context,
+        .glGetProc = glGetProc,
+        .glMakeCurrent = glMakeCurrent,
+        .glSwapWindow = glSwapWindow,
+        .eglMakeCurrent = eglMakeCurrent,
+    };
+    char tablePtr[32];
+    std::snprintf(tablePtr, sizeof(tablePtr), "0x%llx",
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&g_portmasterSdl2ShimSurface)));
+    ::setenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE_INFO", tablePtr, 1);
     std::shared_ptr<wgpu::SurfaceSourceXlibWindow> desc = std::make_shared<wgpu::SurfaceSourceXlibWindow>();
     desc->display = nullptr;
-    desc->window = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(eglSurface));
+    desc->window = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&g_portmasterSdl2ShimSurface));
     return std::move(desc);
   }
   if (SDL_strcmp(driver, "kmsdrm") == 0) {
