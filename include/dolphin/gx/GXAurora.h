@@ -61,6 +61,29 @@ extern "C" {
 
 #define GX_LOAD_AURORA_DESTROY_COPY_TEX 0x0034
 
+#define GX_AURORA_LOAD_VIEWPORT_RENDER GX_LOAD_AURORA_VIEWPORT_RENDER
+#define GX_AURORA_LOAD_SCISSOR_RENDER GX_LOAD_AURORA_SCISSOR_RENDER
+#define GX_AURORA_LOAD_ARRAYBASE GX_LOAD_AURORA_ARRAYBASE
+#define GX_AURORA_LOAD_TEXOBJ GX_LOAD_AURORA_TEXOBJ
+#define GX_AURORA_LOAD_TLUT GX_LOAD_AURORA_TLUT
+#define GX_AURORA_DESTROY_TEXOBJ GX_LOAD_AURORA_DESTROY_TEXOBJ
+#define GX_AURORA_DESTROY_TLUT GX_LOAD_AURORA_DESTROY_TLUT
+#define GX_AURORA_DESTROY_COPY_TEX GX_LOAD_AURORA_DESTROY_COPY_TEX
+
+/**
+ * Begins a draw with vertex payload size instead of explicit vertex count.
+ * Must be followed by a u8 draw command, a u32 vertex payload byte length,
+ * and exactly that many bytes of vertex data.
+ */
+#define GX_AURORA_DRAW_SIZED 0x0040
+
+/**
+ * Draws pre-merged triangles with a prebuilt host-endian u16 index buffer.
+ * Must be followed by a u8 draw command, a u16 vertex count, a u32 index count,
+ * indexCount u16 indices, and vertex payload bytes.
+ */
+#define GX_AURORA_DRAW_INDEXED 0x0041
+
 #define GX2_SET_POLYGON_OFFSET 0x1000
 
 

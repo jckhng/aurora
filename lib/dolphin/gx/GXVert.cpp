@@ -5,6 +5,8 @@
 // Track vertex count between GXBegin/GXEnd for mismatch detection
 static u16 sBeginNVerts = 0;
 static u32 sBeginFifoSize = 0;
+static u32 sBeginSizeOffset = 0;
+static bool sBeginAuto = false;
 static bool sInBegin = false;
 
 extern "C" {
@@ -22,8 +24,18 @@ void GXBegin(GXPrimitive primitive, GXVtxFmt vtxFmt, u16 nVerts) {
     __GXSendFlushPrim();
   }
 
-  GX_WRITE_U8(vtxFmt | primitive);
-  GX_WRITE_U16(nVerts);
+  const u8 drawCmd = static_cast<u8>(vtxFmt) | static_cast<u8>(primitive);
+  sBeginAuto = nVerts == GX_AUTO;
+  if (sBeginAuto) {
+    CHECK(!aurora::gx::fifo::in_display_list(), "GXBegin: GX_AUTO not supported in display lists");
+    GX_WRITE_AURORA(GX_AURORA_DRAW_SIZED);
+    GX_WRITE_U8(drawCmd);
+    sBeginSizeOffset = aurora::gx::fifo::get_buffer_size();
+    GX_WRITE_U32(0);
+  } else {
+    GX_WRITE_U8(drawCmd);
+    GX_WRITE_U16(nVerts);
+  }
 
   // Record state for vertex count validation in GXEnd
   sBeginNVerts = nVerts;
@@ -34,7 +46,10 @@ void GXBegin(GXPrimitive primitive, GXVtxFmt vtxFmt, u16 nVerts) {
 void GXEnd() {
   if (sInBegin) {
     u32 bytesWritten = aurora::gx::fifo::get_buffer_size() - sBeginFifoSize;
-    if (sBeginNVerts > 0 && bytesWritten > 0) {
+    if (sBeginAuto) {
+      aurora::gx::fifo::patch_u32(sBeginSizeOffset, bytesWritten);
+      sBeginAuto = false;
+    } else if (sBeginNVerts > 0 && bytesWritten > 0) {
       u32 vtxSize = bytesWritten / sBeginNVerts;
       u32 remainder = bytesWritten % sBeginNVerts;
       if (remainder != 0) {

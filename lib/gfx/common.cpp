@@ -1,5 +1,7 @@
 #include "common.hpp"
 
+#include <aurora/dl.hpp>
+
 #include "clear.hpp"
 #include "depth_peek.hpp"
 #include "../internal.hpp"
@@ -248,6 +250,7 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
   }
 
   const auto gxStats = gx::fifo::take_portmaster_timing_stats();
+  const auto dlStats = gx::dl::take_optimize_stats();
   const double seconds = static_cast<double>(intervalMs) / 1000.0;
   const double fps = seconds > 0.0 ? static_cast<double>(s_timingFrames) / seconds : 0.0;
   const double avgFrameMs = s_timingFrames > 0 ? static_cast<double>(s_timingFrameUs) / static_cast<double>(s_timingFrames) / 1000.0 : 0.0;
@@ -255,7 +258,7 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
   const auto bpTop = format_top_bp_dirty_regs(gxStats.bpDirtyRegCounts);
   const auto xfTop = format_top_xf_dirty_addrs(gxStats.xfDirtyAddrCounts);
   const auto xfBlockTop = format_top_xf_dirty_addrs(gxStats.xfBlockAddrCounts);
-  Log.info("PortMaster timing: fps={:.2f} frames={} avg_cpu_frame_ms={:.1f} max_cpu_frame_ms={:.1f} draws_last={} uploads[v={} i={} s={}] gx_draws[tex={} cpu={} native={} storage={}] gx_bytes[fifo={} native={}] gx_index[noidx={} idx={} avoided={} bytes={} cache_hit={} cache_miss={}] gx_merge[try={} ok={} dirty={} none={} line={} inst={} tex={} idx={}] gx_dirty[bp={} xf={} cp={} arr={} tex={} other={} clear_skip={} cp_skip={} xf_skip={}] gx_bp[tev={} tref={} render={} tc={} ind={} fog={} reg={} tex={} other={}] gx_bp_top[{}] gx_xf[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_block[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_top[{}] gx_xf_block_top[{}] gx_batch[strip_runs={} strip_draws={} strip_vtx={} strip_max={} quad_runs={} quad_draws={} quad_vtx={} quad_max={}] gx_reuse[cand={} hit={} miss={} same={} cross={} bytes={} avoid={} cache_hit={} cache_miss={} cache_up={} cache_full={} cache_v={} cache_i={}] gx_prim[q={} tri={} strip={} fan={} line={} lstrip={} point={} other={} vtx={}]",
+  Log.info("PortMaster timing: fps={:.2f} frames={} avg_cpu_frame_ms={:.1f} max_cpu_frame_ms={:.1f} draws_last={} uploads[v={} i={} s={}] gx_draws[tex={} cpu={} native={} storage={}] gx_bytes[fifo={} native={}] gx_index[noidx={} idx={} avoided={} bytes={} cache_hit={} cache_miss={}] gx_merge[try={} ok={} dirty={} none={} line={} inst={} tex={} idx={}] gx_dirty[bp={} xf={} cp={} arr={} tex={} other={} clear_skip={} cp_skip={} xf_skip={}] gx_bp[tev={} tref={} render={} tc={} ind={} fog={} reg={} tex={} other={}] gx_bp_top[{}] gx_xf[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_block[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_top[{}] gx_xf_block_top[{}] gx_batch[strip_runs={} strip_draws={} strip_vtx={} strip_max={} quad_runs={} quad_draws={} quad_vtx={} quad_max={}] gx_reuse[cand={} hit={} miss={} same={} cross={} bytes={} avoid={} cache_hit={} cache_miss={} cache_up={} cache_full={} cache_v={} cache_i={}] gx_prim[q={} tri={} strip={} fan={} line={} lstrip={} point={} other={} vtx={}] dl_opt[try={} ok={} fail={} in={} out={} saved={} pass={} draw={} preidx={} q={} tri={} strip={} fan={} unexp={} out_tri={} out_idx={} batch_runs={} batch_draws={} batch_vtx={} batch_max={}]",
            fps, s_timingFrames, avgFrameMs, maxFrameMs, drawCount, vertexWriteSize, indexWriteSize, storageWriteSize,
            gxStats.textureVertexDraws, gxStats.cpuGenericDraws, gxStats.directNativeDraws, gxStats.storageVertexDraws,
            gxStats.fifoBytes, gxStats.nativeBytes, gxStats.noIndexTriangleDraws, gxStats.indexedPrimitiveDraws,
@@ -283,7 +286,12 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
            gxStats.batchCacheUploads, gxStats.batchCacheFull, gxStats.batchCacheVertexBytes,
            gxStats.batchCacheIndexBytes, gxStats.primQuads, gxStats.primTriangles, gxStats.primTriangleStrips,
            gxStats.primTriangleFans, gxStats.primLines, gxStats.primLineStrips, gxStats.primPoints, gxStats.primOther,
-           gxStats.primVertices);
+           gxStats.primVertices, dlStats.attempts, dlStats.successes, dlStats.failures, dlStats.inputBytes,
+           dlStats.outputBytes, dlStats.bytesSaved, dlStats.passthroughCmds, dlStats.inputDraws,
+           dlStats.inputIndexedDraws, dlStats.inputQuads, dlStats.inputTriangles, dlStats.inputTriangleStrips,
+           dlStats.inputTriangleFans, dlStats.unexpandedDraws, dlStats.outputTriangleDraws,
+           dlStats.outputIndexedDraws, dlStats.batchRuns, dlStats.batchDraws, dlStats.batchVertices,
+           dlStats.batchMaxDraws);
 
   s_timingIntervalStart = now;
   s_timingFrames = 0;
@@ -1425,3 +1433,10 @@ void pop_debug_group() {
 }
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::g_stats; }
+float aurora_get_fps() {
+  const auto elapsed = std::chrono::duration<float>(aurora::gfx::Clock::now() - aurora::gfx::s_timingIntervalStart).count();
+  if (elapsed <= 0.0f) {
+    return 0.0f;
+  }
+  return static_cast<float>(aurora::gfx::s_timingFrames) / elapsed;
+}

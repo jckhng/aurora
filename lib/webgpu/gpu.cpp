@@ -1107,7 +1107,7 @@ void shutdown() {
   g_frameBufferResolved = {};
   g_depthBuffer = {};
   g_queue = {};
-  g_surface = {};
+  release_surface();
   g_device = {};
   g_adapter = {};
   g_instance = {};

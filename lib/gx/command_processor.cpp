@@ -754,6 +754,7 @@ static void handle_bp(u32 value, bool bigEndian);
 static void handle_cp(u8 addr, u32 value, bool bigEndian);
 static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian);
 static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian);
+static void handle_draw_payload(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian, u16 vtxCount);
 static void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
 
 void process(const u8* data, u32 size, bool bigEndian) {
@@ -2868,15 +2869,12 @@ static bool portmaster_find_or_upload_strip_batch_cache(GXVtxFmt fmt, u32 fifoSt
   return true;
 }
 
-static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
+static void handle_draw_payload(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian, u16 vtxCount) {
   ZoneScoped;
   u8 opcode = cmd & CP_OPCODE_MASK;
   GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
   GXPrimitive prim = static_cast<GXPrimitive>(opcode);
 
-  CHECK(pos + 2 <= size, "draw vtxCount read overrun");
-  u16 vtxCount = read_u16(data + pos, bigEndian);
-  pos += 2;
   portmaster_note_primitive(prim, vtxCount);
 
   u32 vtxSize;
@@ -3191,6 +3189,13 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
 }
 
+static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
+  CHECK(pos + 2 <= size, "draw vtxCount read overrun");
+  const u16 vtxCount = read_u16(data + pos, bigEndian);
+  pos += 2;
+  handle_draw_payload(cmd, data, pos, size, bigEndian, vtxCount);
+}
+
 static ByteBuffer handle_draw_unmerged_idxBuf;
 
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
@@ -3418,6 +3423,70 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
       array.cachedRange = {};
       portmaster_mark_state_dirty(PortmasterDirtyArray);
     }
+  } else if (subCmd == GX_AURORA_DRAW_SIZED) {
+    CHECK(pos + 5 <= size, "GX_AURORA_DRAW_SIZED read overrun");
+    const u8 drawCmd = data[pos++];
+    const u32 byteLen = read_u32(data + pos, bigEndian);
+    pos += 4;
+
+    if (byteLen == 0) {
+      return;
+    }
+
+    const GXVtxFmt fmt = static_cast<GXVtxFmt>(drawCmd & CP_VAT_MASK);
+    u32 vtxSize;
+    if (g_gxState.lastVtxFmt == fmt) LIKELY {
+      vtxSize = g_gxState.lastVtxSize;
+    } else UNLIKELY {
+      vtxSize = calculate_last_vtx_size(fmt);
+    }
+
+    CHECK(vtxSize != 0, "GX_AURORA_DRAW_SIZED: zero vertex size for format {}", static_cast<u32>(fmt));
+    CHECK(byteLen % vtxSize == 0, "GX_AURORA_DRAW_SIZED: {} bytes is not divisible by vertex size {}", byteLen,
+          vtxSize);
+    const u32 vtxCount = byteLen / vtxSize;
+    CHECK(vtxCount <= 0xffffu, "GX_AURORA_DRAW_SIZED: too many vertices ({})", vtxCount);
+    handle_draw_payload(drawCmd, data, pos, size, bigEndian, static_cast<u16>(vtxCount));
+  } else if (subCmd == GX_AURORA_DRAW_INDEXED) {
+    CHECK(pos + 7 <= size, "GX_AURORA_DRAW_INDEXED read overrun");
+    const u8 drawCmd = data[pos++];
+    const u16 vtxCount = read_u16(data + pos, bigEndian);
+    pos += 2;
+    const u32 indexCount = read_u32(data + pos, bigEndian);
+    pos += 4;
+
+    const u8 opcode = drawCmd & CP_OPCODE_MASK;
+    const GXVtxFmt fmt = static_cast<GXVtxFmt>(drawCmd & CP_VAT_MASK);
+    const GXPrimitive prim = static_cast<GXPrimitive>(opcode);
+    portmaster_note_primitive(prim, vtxCount);
+
+    u32 vtxSize;
+    if (g_gxState.lastVtxFmt == fmt) LIKELY {
+      vtxSize = g_gxState.lastVtxSize;
+    } else UNLIKELY {
+      vtxSize = calculate_last_vtx_size(fmt);
+    }
+
+    const u32 indexBytes = indexCount * sizeof(u16);
+    const u32 totalVtxBytes = static_cast<u32>(vtxCount) * vtxSize;
+    CHECK(pos + indexBytes + totalVtxBytes <= size, "GX_AURORA_DRAW_INDEXED data overrun");
+
+    const auto indexRange = gfx::push_indices(data + pos, indexBytes);
+    pos += indexBytes;
+    const auto vertRange = gfx::push_verts(data + pos, totalVtxBytes);
+    pos += totalVtxBytes;
+
+    const bool forceTextureVertexFetch = portmaster_no_vertex_storage_mode() && portmaster_texture_vertex_fetch_mode();
+    portmaster_note_timing_fifo(totalVtxBytes + indexBytes);
+    portmaster_note_indexed_primitive_draw(indexBytes);
+    if (forceTextureVertexFetch) {
+      portmaster_note_timing_texture_vertex();
+      portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, 0, PortmasterExpandPath::TextureVertex);
+    } else {
+      portmaster_note_timing_storage_vertex();
+      portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, 0, PortmasterExpandPath::StorageVertex);
+    }
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, nullptr, forceTextureVertexFetch, indexRange, indexCount);
   } else if (subCmd == GX_LOAD_AURORA_TEXOBJ) {
     CHECK(pos + 34 <= size, "GX_LOAD_AURORA_TEXOBJ read overrun");
     const auto texMapId = data[pos];

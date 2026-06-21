@@ -20,6 +20,7 @@ void init();
 
 // Out-of-line slow path: grows internal buffer then appends data
 void write_data_grow(const void* data, uint32_t length);
+void patch_u32(uint32_t offset, uint32_t val);
 
 inline void write_data(const void* data, const uint32_t length) {
   if (!detail::sInDisplayList)

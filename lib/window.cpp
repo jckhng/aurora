@@ -432,6 +432,10 @@ void shutdown() {
   SDL_RemoveEventWatch(lifecycle_event_watch, nullptr);
   destroy_window();
   TRY_WARN(SDL_EnableScreenSaver(), "Error enabling screensaver: {}", SDL_GetError());
+  if (SDL_getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_OWNED_EGL") != nullptr) {
+    Log.info("PortMaster SDL2-shim owned EGL: skipping SDL_Quit during process shutdown");
+    return;
+  }
   SDL_Quit();
 }
 

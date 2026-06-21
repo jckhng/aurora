@@ -30,6 +30,7 @@ extern "C" {
  * See GXAurora.h for further documentation on these.
  */
 #define GX_LOAD_AURORA              0x50
+#define GX_AURORA                   GX_LOAD_AURORA
 
 #define GX_OPCODE_MASK              0xF8
 #define GX_VAT_MASK                 0x07
