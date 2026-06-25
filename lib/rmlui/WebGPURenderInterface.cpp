@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -33,6 +34,23 @@ struct Image {
   uint32_t width;
   uint32_t height;
 };
+
+float portmaster_rml_safe_top() noexcept {
+  const char* value = std::getenv("DUSKLIGHT_PORTMASTER_RML_SAFE_TOP");
+  if (value == nullptr) {
+    return 0.f;
+  }
+  const int offset = std::atoi(value);
+  if (offset <= 0) {
+    return 0.f;
+  }
+  static int s_loggedOffset = -1;
+  if (s_loggedOffset != offset) {
+    Log.info("PortMaster RmlUi safe top offset: {}", offset);
+    s_loggedOffset = offset;
+  }
+  return static_cast<float>(offset);
+}
 
 struct ShaderGeometryData {
   wgpu::Buffer m_vertexBuffer;
@@ -2368,7 +2386,7 @@ void WebGPURenderInterface::SetupRenderState(const Rml::Vector2f& translation) {
 
   const UniformBlock ubo{
       .MVP = proj * m_translationMatrix,
-      .translation = {translation.x, translation.y, 0.0f, 1.0f},
+      .translation = {translation.x, translation.y + portmaster_rml_safe_top(), 0.0f, 1.0f},
       .Gamma = m_gamma,
   };
   webgpu::g_queue.WriteBuffer(m_uniformBuffer, m_uniformCurrentOffset, &ubo, sizeof(UniformBlock));

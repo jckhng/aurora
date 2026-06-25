@@ -198,6 +198,101 @@ if (AURORA_ENABLE_GX)
     )
     FetchContent_MakeAvailable(imgui)
 
+    set(AURORA_IMGUI_WGPU_BACKEND "${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp")
+    file(READ "${AURORA_IMGUI_WGPU_BACKEND}" AURORA_IMGUI_WGPU_SOURCE)
+    if (AURORA_IMGUI_WGPU_SOURCE MATCHES "DUSKLIGHT_PORTMASTER_VISIBLE_SCISSOR")
+      message(STATUS "aurora: imgui WGPU backend already has PortMaster visible viewport/scissor patch")
+    else ()
+      string(REPLACE
+        "#include <limits.h>
+#include <webgpu/webgpu.h>"
+        "#include <limits.h>
+#include <stdlib.h>
+#include <webgpu/webgpu.h>"
+        AURORA_IMGUI_WGPU_SOURCE "${AURORA_IMGUI_WGPU_SOURCE}")
+      string(REPLACE
+        "extern ImGuiID ImHashData(const void* data_p, size_t data_size, ImU32 seed);
+#define MEMALIGN"
+        "extern ImGuiID ImHashData(const void* data_p, size_t data_size, ImU32 seed);
+
+// DUSKLIGHT_PORTMASTER_VISIBLE_SCISSOR
+static void ImGui_ImplWGPU_PortMasterVisibleViewport(float fb_width, float fb_height, float* viewport_x, float* viewport_y, float* viewport_width, float* viewport_height)
+{
+    *viewport_x = 0.0f;
+    *viewport_y = 0.0f;
+    *viewport_width = fb_width;
+    *viewport_height = fb_height;
+    if (const char* visible_width_env = getenv(\"DUSKLIGHT_PORTMASTER_VISIBLE_WIDTH\")) {
+        if (const char* visible_height_env = getenv(\"DUSKLIGHT_PORTMASTER_VISIBLE_HEIGHT\")) {
+            const float visible_width = (float)atoi(visible_width_env);
+            const float visible_height = (float)atoi(visible_height_env);
+            if (visible_width > 0.0f && visible_height > 0.0f) {
+                *viewport_x = (fb_width - visible_width) * 0.5f;
+                *viewport_y = (fb_height - visible_height) * 0.5f;
+                *viewport_width = visible_width;
+                *viewport_height = visible_height;
+                if (const char* visible_left_env = getenv(\"DUSKLIGHT_PORTMASTER_VISIBLE_LEFT\")) {
+                    const float visible_left = (float)atoi(visible_left_env);
+                    if (visible_left >= 0.0f) {
+                        *viewport_x = visible_left;
+                    }
+                }
+                if (const char* visible_top_env = getenv(\"DUSKLIGHT_PORTMASTER_VISIBLE_TOP\")) {
+                    const float visible_top = (float)atoi(visible_top_env);
+                    if (visible_top >= 0.0f) {
+                        *viewport_y = visible_top;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#define MEMALIGN"
+        AURORA_IMGUI_WGPU_SOURCE "${AURORA_IMGUI_WGPU_SOURCE}")
+      string(REPLACE
+        "wgpuRenderPassEncoderSetViewport(ctx, 0, 0, draw_data->FramebufferScale.x * draw_data->DisplaySize.x, draw_data->FramebufferScale.y * draw_data->DisplaySize.y, 0, 1);"
+        "float viewport_x = 0.0f;
+    float viewport_y = 0.0f;
+    float viewport_width = draw_data->FramebufferScale.x * draw_data->DisplaySize.x;
+    float viewport_height = draw_data->FramebufferScale.y * draw_data->DisplaySize.y;
+    ImGui_ImplWGPU_PortMasterVisibleViewport(viewport_width, viewport_height, &viewport_x, &viewport_y, &viewport_width, &viewport_height);
+    wgpuRenderPassEncoderSetViewport(ctx, viewport_x, viewport_y, viewport_width, viewport_height, 0, 1);"
+        AURORA_IMGUI_WGPU_SOURCE "${AURORA_IMGUI_WGPU_SOURCE}")
+      string(REPLACE
+        "    ImVec2 clip_scale = draw_data->FramebufferScale;
+    ImVec2 clip_off = draw_data->DisplayPos;"
+        "    ImVec2 clip_scale = draw_data->FramebufferScale;
+    ImVec2 clip_off = draw_data->DisplayPos;
+    float portmaster_clip_x = 0.0f;
+    float portmaster_clip_y = 0.0f;
+    float portmaster_clip_width = (float)fb_width;
+    float portmaster_clip_height = (float)fb_height;
+    ImGui_ImplWGPU_PortMasterVisibleViewport((float)fb_width, (float)fb_height, &portmaster_clip_x, &portmaster_clip_y, &portmaster_clip_width, &portmaster_clip_height);"
+        AURORA_IMGUI_WGPU_SOURCE "${AURORA_IMGUI_WGPU_SOURCE}")
+      string(REPLACE
+        "                // Clamp to viewport as wgpuRenderPassEncoderSetScissorRect() won't accept values that are off bounds
+                if (clip_min.x < 0.0f) { clip_min.x = 0.0f; }
+                if (clip_min.y < 0.0f) { clip_min.y = 0.0f; }
+                if (clip_max.x > fb_width) { clip_max.x = (float)fb_width; }
+                if (clip_max.y > fb_height) { clip_max.y = (float)fb_height; }"
+        "                clip_min.x += portmaster_clip_x;
+                clip_min.y += portmaster_clip_y;
+                clip_max.x += portmaster_clip_x;
+                clip_max.y += portmaster_clip_y;
+
+                // Clamp to viewport as wgpuRenderPassEncoderSetScissorRect() won't accept values that are off bounds
+                const float portmaster_clip_max_x = portmaster_clip_x + portmaster_clip_width;
+                const float portmaster_clip_max_y = portmaster_clip_y + portmaster_clip_height;
+                if (clip_min.x < portmaster_clip_x) { clip_min.x = portmaster_clip_x; }
+                if (clip_min.y < portmaster_clip_y) { clip_min.y = portmaster_clip_y; }
+                if (clip_max.x > portmaster_clip_max_x) { clip_max.x = portmaster_clip_max_x; }
+                if (clip_max.y > portmaster_clip_max_y) { clip_max.y = portmaster_clip_max_y; }"
+        AURORA_IMGUI_WGPU_SOURCE "${AURORA_IMGUI_WGPU_SOURCE}")
+      file(WRITE "${AURORA_IMGUI_WGPU_BACKEND}" "${AURORA_IMGUI_WGPU_SOURCE}")
+      message(STATUS "aurora: patched imgui WGPU backend for PortMaster visible viewport/scissor")
+    endif ()
+
     add_library(imgui STATIC
       ${imgui_SOURCE_DIR}/imgui.cpp
       ${imgui_SOURCE_DIR}/imgui_demo.cpp

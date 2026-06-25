@@ -102,6 +102,10 @@ bool portmaster_constrained_render_surface() noexcept {
          SDL_getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
 }
 
+bool portmaster_prefer_fbdev_output_size() noexcept {
+  return SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr;
+}
+
 #if defined(SDL_PLATFORM_LINUX)
 bool fbdev_physical_size(int& width, int& height) noexcept {
   int fd = open("/dev/fb0", O_RDONLY, 0);
@@ -289,7 +293,10 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
-  SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  SDL_WindowFlags flags = 0;
+  if (SDL_getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") == nullptr) {
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  }
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
@@ -313,7 +320,8 @@ bool create_window(AuroraBackend backend) {
 #ifdef DAWN_ENABLE_BACKEND_OPENGL
   case BACKEND_OPENGL:
   case BACKEND_OPENGLES:
-    if (SDL_getenv("DUSKLIGHT_PORTMASTER_X11_DAWN") == nullptr) {
+    if (SDL_getenv("DUSKLIGHT_PORTMASTER_X11_DAWN") == nullptr &&
+        SDL_getenv("DUSKLIGHT_PORTMASTER_SDL_RENDERER_PRESENT") == nullptr) {
       flags |= SDL_WINDOW_OPENGL;
     }
     break;
@@ -449,8 +457,38 @@ AuroraWindowSize get_window_size() {
          SDL_GetError());
 
 #if defined(SDL_PLATFORM_LINUX)
-  if (SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr) {
-    fbdev_physical_size(native_fb_w, native_fb_h);
+  if (portmaster_prefer_fbdev_output_size()) {
+    const int oldNativeFbW = native_fb_w;
+    const int oldNativeFbH = native_fb_h;
+    if (fbdev_physical_size(native_fb_w, native_fb_h) && (native_fb_w != oldNativeFbW || native_fb_h != oldNativeFbH)) {
+      static bool loggedFbdevOverride = false;
+      if (!loggedFbdevOverride) {
+        Log.info("PortMaster output size override: SDL drawable {}x{} -> fbdev {}x{}", oldNativeFbW, oldNativeFbH,
+                 native_fb_w, native_fb_h);
+        loggedFbdevOverride = true;
+      }
+    }
+  } else if (SDL_getenv("DUSKLIGHT_PORTMASTER_USE_FBDEV_SIZE") != nullptr) {
+    int visibleW = 0;
+    int visibleH = 0;
+    if (fbdev_physical_size(visibleW, visibleH)) {
+      static bool loggedFbdevVisible = false;
+      if (!loggedFbdevVisible) {
+        Log.info("PortMaster visible output area: SDL drawable {}x{} fbdev {}x{}", native_fb_w, native_fb_h, visibleW,
+                 visibleH);
+        loggedFbdevVisible = true;
+      }
+      char widthBuf[16];
+      char heightBuf[16];
+      SDL_snprintf(widthBuf, sizeof(widthBuf), "%d", visibleW);
+      SDL_snprintf(heightBuf, sizeof(heightBuf), "%d", visibleH);
+      if (SDL_getenv("DUSKLIGHT_PORTMASTER_VISIBLE_WIDTH") == nullptr) {
+        SDL_setenv_unsafe("DUSKLIGHT_PORTMASTER_VISIBLE_WIDTH", widthBuf, 1);
+      }
+      if (SDL_getenv("DUSKLIGHT_PORTMASTER_VISIBLE_HEIGHT") == nullptr) {
+        SDL_setenv_unsafe("DUSKLIGHT_PORTMASTER_VISIBLE_HEIGHT", heightBuf, 1);
+      }
+    }
   }
 #endif
 

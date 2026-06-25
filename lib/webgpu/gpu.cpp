@@ -13,6 +13,7 @@
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 #include <magic_enum.hpp>
+#include <SDL3/SDL_loadso.h>
 #include <webgpu/webgpu_cpp.h>
 #include <SDL3/SDL_video.h>
 
@@ -134,6 +135,71 @@ static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
 }
 
 #ifdef WEBGPU_DAWN
+static SDL_SharedObject* g_portmasterEglLibrary = nullptr;
+static SDL_SharedObject* g_portmasterGlesLibrary = nullptr;
+using PortMasterEglGetProcAddressFn = SDL_FunctionPointer (*)(const char*);
+static PortMasterEglGetProcAddressFn g_portmasterEglGetProcAddress = nullptr;
+
+static dawn::native::opengl::EGLFunctionPointerType portmaster_egl_get_proc(const char* name) {
+  if (name == nullptr) {
+    return nullptr;
+  }
+
+  if (g_portmasterEglLibrary == nullptr) {
+    for (const char* libraryName : {"libEGL.so.1", "libEGL.so"}) {
+      g_portmasterEglLibrary = SDL_LoadObject(libraryName);
+      if (g_portmasterEglLibrary != nullptr) {
+        Log.info("PortMaster EGL proc loader opened {}", libraryName);
+        g_portmasterEglGetProcAddress =
+            reinterpret_cast<PortMasterEglGetProcAddressFn>(SDL_LoadFunction(g_portmasterEglLibrary, "eglGetProcAddress"));
+        break;
+      }
+    }
+  }
+
+  if (g_portmasterEglLibrary != nullptr) {
+    if (SDL_FunctionPointer function = SDL_LoadFunction(g_portmasterEglLibrary, name)) {
+      return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+    }
+    if (g_portmasterEglGetProcAddress != nullptr) {
+      if (SDL_FunctionPointer function = g_portmasterEglGetProcAddress(name)) {
+        return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+      }
+    }
+  }
+
+  if (g_portmasterGlesLibrary == nullptr) {
+    for (const char* libraryName : {"libGLESv2.so.2", "libGLESv2.so"}) {
+      g_portmasterGlesLibrary = SDL_LoadObject(libraryName);
+      if (g_portmasterGlesLibrary != nullptr) {
+        Log.info("PortMaster GLES proc loader opened {}", libraryName);
+        break;
+      }
+    }
+  }
+
+  if (g_portmasterGlesLibrary != nullptr) {
+    if (SDL_FunctionPointer function = SDL_LoadFunction(g_portmasterGlesLibrary, name)) {
+      return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+    }
+  }
+
+  return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(SDL_GL_GetProcAddress(name));
+}
+
+static bool configure_portmaster_egl_proc(dawn::native::opengl::RequestAdapterOptionsGetGLProc& glProcOptions) {
+  if (std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") == nullptr &&
+      std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") == nullptr &&
+      std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EXTERNAL_PRESENT") == nullptr) {
+    return false;
+  }
+
+  glProcOptions.getProc = portmaster_egl_get_proc;
+  glProcOptions.display = nullptr;
+  Log.info("Requesting Dawn OpenGL adapter through PortMaster EGL proc loader");
+  return true;
+}
+
 static bool configure_sdl2shim_gl_proc(dawn::native::opengl::RequestAdapterOptionsGetGLProc& glProcOptions) {
   SDL_Window* window = window::get_sdl_window();
   if (!ensure_sdl2shim_egl_properties(window)) {
@@ -147,9 +213,14 @@ static bool configure_sdl2shim_gl_proc(dawn::native::opengl::RequestAdapterOptio
     return false;
   }
 
-  glProcOptions.getProc = reinterpret_cast<dawn::native::opengl::EGLGetProcProc>(glGetProc);
+  auto sdlGetProc = reinterpret_cast<dawn::native::opengl::EGLGetProcProc>(glGetProc);
+  const bool useSystemEglProc =
+      std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_DAWN_CONTEXT_PRESENT") != nullptr ||
+      sdlGetProc("eglChooseConfig") == nullptr;
+  glProcOptions.getProc = useSystemEglProc ? portmaster_egl_get_proc : sdlGetProc;
   glProcOptions.display = eglDisplay;
-  Log.info("Requesting Dawn OpenGL adapter through SDL2-shim EGL display={} getProc={}", eglDisplay, glGetProc);
+  Log.info("Requesting Dawn OpenGL adapter through SDL2-shim EGL display={} getProc={} loader={}", eglDisplay,
+           glGetProc, useSystemEglProc ? "libEGL" : "SDL_GL_GetProcAddress");
   return true;
 }
 #endif
@@ -320,6 +391,14 @@ uint32_t viewport_extent(float value) noexcept {
   return std::max(1u, static_cast<uint32_t>(std::lround(std::max(value, 1.f))));
 }
 
+wgpu::TextureFormat select_depth_format() noexcept {
+  if (std::getenv("DUSKLIGHT_PORTMASTER_DEPTH24PLUS") != nullptr) {
+    Log.info("PortMaster depth format override: Depth24Plus");
+    return wgpu::TextureFormat::Depth24Plus;
+  }
+  return wgpu::TextureFormat::Depth32Float;
+}
+
 } // namespace
 
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled) {
@@ -403,21 +482,63 @@ Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_hei
     return {};
   }
 
-  uint32_t viewport_width = surface_width;
+  uint32_t visible_width = surface_width;
+  uint32_t visible_height = surface_height;
+  uint32_t visible_left = 0;
+  uint32_t visible_top = 0;
+  const char* visibleWidthEnv = std::getenv("DUSKLIGHT_PORTMASTER_VISIBLE_WIDTH");
+  const char* visibleHeightEnv = std::getenv("DUSKLIGHT_PORTMASTER_VISIBLE_HEIGHT");
+  if (visibleWidthEnv != nullptr && visibleHeightEnv != nullptr) {
+    const int requestedVisibleWidth = std::atoi(visibleWidthEnv);
+    const int requestedVisibleHeight = std::atoi(visibleHeightEnv);
+    if (requestedVisibleWidth > 0 && requestedVisibleHeight > 0) {
+      visible_width = std::min<uint32_t>(surface_width, static_cast<uint32_t>(requestedVisibleWidth));
+      visible_height = std::min<uint32_t>(surface_height, static_cast<uint32_t>(requestedVisibleHeight));
+      visible_left = (surface_width - visible_width) / 2;
+      visible_top = (surface_height - visible_height) / 2;
+      if (const char* visibleLeftEnv = std::getenv("DUSKLIGHT_PORTMASTER_VISIBLE_LEFT")) {
+        const int requestedVisibleLeft = std::atoi(visibleLeftEnv);
+        if (requestedVisibleLeft >= 0) {
+          visible_left = std::min<uint32_t>(surface_width - visible_width, static_cast<uint32_t>(requestedVisibleLeft));
+        }
+      }
+      if (const char* visibleTopEnv = std::getenv("DUSKLIGHT_PORTMASTER_VISIBLE_TOP")) {
+        const int requestedVisibleTop = std::atoi(visibleTopEnv);
+        if (requestedVisibleTop >= 0) {
+          visible_top = std::min<uint32_t>(surface_height - visible_height, static_cast<uint32_t>(requestedVisibleTop));
+        }
+      }
+      static uint32_t s_loggedSurfaceWidth = 0;
+      static uint32_t s_loggedSurfaceHeight = 0;
+      static uint32_t s_loggedVisibleWidth = 0;
+      static uint32_t s_loggedVisibleHeight = 0;
+      if (s_loggedSurfaceWidth != surface_width || s_loggedSurfaceHeight != surface_height ||
+          s_loggedVisibleWidth != visible_width || s_loggedVisibleHeight != visible_height) {
+        Log.info("PortMaster present visible area: surface {}x{} visible {}x{} at {},{}", surface_width,
+                 surface_height, visible_width, visible_height, visible_left, visible_top);
+        s_loggedSurfaceWidth = surface_width;
+        s_loggedSurfaceHeight = surface_height;
+        s_loggedVisibleWidth = visible_width;
+        s_loggedVisibleHeight = visible_height;
+      }
+    }
+  }
+
+  uint32_t viewport_width = visible_width;
   uint32_t viewport_height = std::min<uint32_t>(
-      surface_height, std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_width) *
+      visible_height, std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_width) *
                                                                                static_cast<double>(content_height) /
                                                                                static_cast<double>(content_width)))));
-  if (viewport_height == surface_height) {
+  if (viewport_height == visible_height) {
     viewport_width = std::min<uint32_t>(
-        surface_width, std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_height) *
+        visible_width, std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_height) *
                                                                                 static_cast<double>(content_width) /
                                                                                 static_cast<double>(content_height)))));
   }
 
   return {
-      .left = static_cast<float>((surface_width - viewport_width) / 2),
-      .top = static_cast<float>((surface_height - viewport_height) / 2),
+      .left = static_cast<float>(visible_left + (visible_width - viewport_width) / 2),
+      .top = static_cast<float>(visible_top + (visible_height - viewport_height) / 2),
       .width = static_cast<float>(viewport_width),
       .height = static_cast<float>(viewport_height),
       .znear = 0.f,
@@ -831,7 +952,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 #ifdef WEBGPU_DAWN
     dawn::native::opengl::RequestAdapterOptionsGetGLProc glProcOptions;
     if ((backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) &&
-        configure_sdl2shim_gl_proc(glProcOptions)) {
+        (configure_sdl2shim_gl_proc(glProcOptions) || configure_portmaster_egl_proc(glProcOptions))) {
       adapterNextInChain = &glProcOptions;
     }
 #endif
@@ -1042,7 +1163,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
                 .height = nativeFbHeight,
                 .presentMode = wgpu::PresentMode::Fifo,
             },
-        .depthFormat = wgpu::TextureFormat::Depth32Float,
+        .depthFormat = select_depth_format(),
         .msaaSamples = g_config.msaa,
         .textureAnisotropy = g_config.maxTextureAnisotropy,
     };
@@ -1082,7 +1203,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
               .height = size.native_fb_height,
               .presentMode = presentMode,
           },
-      .depthFormat = wgpu::TextureFormat::Depth32Float,
+      .depthFormat = select_depth_format(),
       .msaaSamples = g_config.msaa,
       .textureAnisotropy = g_config.maxTextureAnisotropy,
   };

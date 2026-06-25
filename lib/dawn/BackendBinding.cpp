@@ -12,6 +12,8 @@
 #include <unistd.h>
 
 #if !defined(SDL_PLATFORM_MACOS) && !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_TVOS)
+#include <SDL3/SDL_loadso.h>
+#include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_video.h>
 #endif
 
@@ -33,6 +35,12 @@ constexpr const char* SDL2_SHIM_CONTEXT_PROP = "SDL.window.sdl2_backend.context"
 constexpr const char* SDL2_SHIM_GL_MAKE_CURRENT_PROP = "SDL.window.sdl2_backend.gl_make_current";
 constexpr const char* SDL2_SHIM_GL_SWAP_WINDOW_PROP = "SDL.window.sdl2_backend.gl_swap_window";
 constexpr const char* SDL2_SHIM_EGL_MAKE_CURRENT_PROP = "SDL.window.sdl2_backend.egl_make_current";
+constexpr int SDL2_EGL_DRAW = 0x3059;
+
+using Sdl2GlMakeCurrentFn = int (*)(void*, void*);
+using EglGetCurrentDisplayFn = void* (*)();
+using EglGetCurrentSurfaceFn = void* (*)(int);
+using EglGetCurrentContextFn = void* (*)();
 
 struct PortmasterSdl2ShimEglSurface {
   uint32_t magic;
@@ -56,7 +64,12 @@ constexpr uint32_t PortmasterSdl2ShimEglSurfaceMagic = 0x44533245; // DS2E
 constexpr uint32_t PortmasterSdl2ShimEglSurfaceVersion = 2;
 constexpr uint32_t PortmasterSdl2ShimFlagOwnedEgl = 1u << 0;
 constexpr uint32_t PortmasterSdl2ShimFlagSdlSwap = 1u << 1;
+constexpr uint32_t PortmasterSdl2ShimFlagDawnContextPresent = 1u << 2;
 PortmasterSdl2ShimEglSurface g_portmasterSdl2ShimSurface{};
+SDL_SharedObject* g_portmasterSdl2ShimEglLibrary = nullptr;
+EglGetCurrentDisplayFn g_portmasterEglGetCurrentDisplay = nullptr;
+EglGetCurrentSurfaceFn g_portmasterEglGetCurrentSurface = nullptr;
+EglGetCurrentContextFn g_portmasterEglGetCurrentContext = nullptr;
 
 struct PortmasterFbdevWindow {
   unsigned short width;
@@ -78,6 +91,69 @@ bool init_portmaster_fbdev_window() {
   g_portmasterFbdevWindow.width = static_cast<unsigned short>(vinfo.xres);
   g_portmasterFbdevWindow.height = static_cast<unsigned short>(vinfo.yres);
   return true;
+}
+
+template <typename T>
+T load_sdl2shim_egl_function(const char* name) {
+  if (g_portmasterSdl2ShimEglLibrary == nullptr) {
+    for (const char* libraryName : {"libEGL.so.1", "libEGL.so"}) {
+      g_portmasterSdl2ShimEglLibrary = SDL_LoadObject(libraryName);
+      if (g_portmasterSdl2ShimEglLibrary != nullptr) {
+        Log.info("SDL2-shim EGL handle fallback opened {}", libraryName);
+        break;
+      }
+    }
+  }
+  if (g_portmasterSdl2ShimEglLibrary == nullptr) {
+    return nullptr;
+  }
+  return reinterpret_cast<T>(SDL_LoadFunction(g_portmasterSdl2ShimEglLibrary, name));
+}
+
+void fill_sdl2shim_current_egl_handles(SDL_PropertiesID props, void* sdl2Window, void* sdl2Context,
+                                       void* glMakeCurrent, void*& eglDisplay, void*& eglSurface,
+                                       void*& eglContext) {
+  if ((eglDisplay != nullptr && eglSurface != nullptr && eglContext != nullptr) || sdl2Window == nullptr ||
+      sdl2Context == nullptr || glMakeCurrent == nullptr) {
+    return;
+  }
+
+  if (reinterpret_cast<Sdl2GlMakeCurrentFn>(glMakeCurrent)(sdl2Window, sdl2Context) != 0) {
+    Log.warn("SDL2-shim EGL handle fallback could not make SDL2 context current");
+    return;
+  }
+
+  if (g_portmasterEglGetCurrentDisplay == nullptr) {
+    g_portmasterEglGetCurrentDisplay = load_sdl2shim_egl_function<EglGetCurrentDisplayFn>("eglGetCurrentDisplay");
+  }
+  if (g_portmasterEglGetCurrentSurface == nullptr) {
+    g_portmasterEglGetCurrentSurface = load_sdl2shim_egl_function<EglGetCurrentSurfaceFn>("eglGetCurrentSurface");
+  }
+  if (g_portmasterEglGetCurrentContext == nullptr) {
+    g_portmasterEglGetCurrentContext = load_sdl2shim_egl_function<EglGetCurrentContextFn>("eglGetCurrentContext");
+  }
+
+  if (eglDisplay == nullptr && g_portmasterEglGetCurrentDisplay != nullptr) {
+    eglDisplay = g_portmasterEglGetCurrentDisplay();
+  }
+  if (eglSurface == nullptr && g_portmasterEglGetCurrentSurface != nullptr) {
+    eglSurface = g_portmasterEglGetCurrentSurface(SDL2_EGL_DRAW);
+  }
+  if (eglContext == nullptr && g_portmasterEglGetCurrentContext != nullptr) {
+    eglContext = g_portmasterEglGetCurrentContext();
+  }
+
+  if (eglDisplay != nullptr) {
+    SDL_SetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, eglDisplay);
+  }
+  if (eglSurface != nullptr) {
+    SDL_SetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, eglSurface);
+  }
+  if (eglContext != nullptr) {
+    SDL_SetPointerProperty(props, SDL2_SHIM_EGL_CONTEXT_PROP, eglContext);
+  }
+  Log.info("SDL2-shim EGL handle fallback resolved display={} surface={} context={}", eglDisplay, eglSurface,
+           eglContext);
 }
 #endif
 } // namespace
@@ -157,6 +233,11 @@ std::shared_ptr<wgpu::ChainedStruct> SetupWindowAndGetSurfaceDescriptor(SDL_Wind
     if (swapPresent == nullptr || (swapPresent[0] != '\0' && swapPresent[0] != '0')) {
       flags |= PortmasterSdl2ShimFlagSdlSwap;
     }
+    if (std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_DAWN_CONTEXT_PRESENT") != nullptr) {
+      flags |= PortmasterSdl2ShimFlagDawnContextPresent;
+    }
+    fill_sdl2shim_current_egl_handles(props, sdl2Window, sdl2Context, glMakeCurrent, eglDisplay, eglSurface,
+                                      eglContext);
     Log.info("SDL2-shim Dawn surface properties: display={} surface={} eglContext={} getProc={} window={} "
              "context={} makeCurrent={} swapWindow={} eglMakeCurrent={} drawable={}x{} flags=0x{:x} table={}",
              eglDisplay, eglSurface, eglContext, glGetProc, sdl2Window, sdl2Context, glMakeCurrent, glSwapWindow,

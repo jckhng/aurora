@@ -19,6 +19,7 @@
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_opengles2.h>
 #include <SDL3/SDL_properties.h>
+#include <SDL3/SDL_render.h>
 #include <SDL3/SDL_video.h>
 #include <magic_enum.hpp>
 
@@ -411,11 +412,18 @@ struct PresenterState {
   void* sdl2Context = nullptr;
   void* sdl2EglDisplay = nullptr;
   void* sdl2EglSurface = nullptr;
+  bool borrowedSdl2Context = false;
   bool loggedActive = false;
   bool loggedContext = false;
   bool loggedFramebuffer = false;
+  bool loggedRenderer = false;
   bool loggedGlError = false;
   bool glReady = false;
+
+  SDL_Renderer* renderer = nullptr;
+  SDL_Texture* rendererTexture = nullptr;
+  uint32_t rendererTextureWidth = 0;
+  uint32_t rendererTextureHeight = 0;
 
   GLuint program = 0;
   GLuint texture = 0;
@@ -530,6 +538,8 @@ GLFns gl;
 bool g_loadedFns = false;
 
 bool enabled() noexcept { return std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EXTERNAL_PRESENT") != nullptr; }
+
+bool renderer_enabled() noexcept { return std::getenv("DUSKLIGHT_PORTMASTER_SDL_RENDERER_PRESENT") != nullptr; }
 
 uint32_t present_interval() noexcept {
   const char* value = std::getenv("DUSKLIGHT_PORTMASTER_PRESENT_INTERVAL");
@@ -791,23 +801,31 @@ bool ensure_context() {
     return false;
   }
   if (g_sdlState.context == nullptr) {
-    if (load_sdl2shim_present_hooks(sdlWindow)) {
-      g_sdlState.context = static_cast<SDL_GLContext>(g_sdlState.sdl2Context);
-      g_sdlState.ownsContext = false;
-    } else {
+    const bool borrowContext = std::getenv("DUSKLIGHT_PORTMASTER_SDL_PRESENTER_BORROW_CONTEXT") != nullptr;
+    const bool preferOwnContext = std::getenv("DUSKLIGHT_PORTMASTER_SDL_PRESENTER_OWN_CONTEXT") != nullptr || !borrowContext;
+    if (preferOwnContext) {
       SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
       SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
       SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
       SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
       g_sdlState.context = SDL_GL_CreateContext(sdlWindow);
       g_sdlState.ownsContext = g_sdlState.context != nullptr;
+      if (g_sdlState.context == nullptr) {
+        Log.warn("PortMaster SDL presenter owned context failed, trying borrowed SDL2 context: {}", SDL_GetError());
+      }
+    }
+    if (g_sdlState.context == nullptr && load_sdl2shim_present_hooks(sdlWindow)) {
+      g_sdlState.context = static_cast<SDL_GLContext>(g_sdlState.sdl2Context);
+      g_sdlState.ownsContext = false;
+      g_sdlState.borrowedSdl2Context = true;
     }
   }
   if (g_sdlState.context == nullptr) {
     Log.warn("PortMaster SDL presenter has no GL context: {}", SDL_GetError());
     return false;
   }
-  if (g_sdl2GlMakeCurrent != nullptr && g_sdlState.sdl2Window != nullptr && g_sdlState.sdl2Context != nullptr) {
+  if (g_sdlState.borrowedSdl2Context && g_sdl2GlMakeCurrent != nullptr && g_sdlState.sdl2Window != nullptr &&
+      g_sdlState.sdl2Context != nullptr) {
     if (g_sdl2GlMakeCurrent(g_sdlState.sdl2Window, g_sdlState.sdl2Context) != 0) {
       Log.warn("PortMaster SDL presenter SDL2 MakeCurrent failed");
       return false;
@@ -846,11 +864,14 @@ bool ensure_context() {
     gl.GetIntegerv(GL_VIEWPORT, viewport);
     gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
     const GLenum status = gl.CheckFramebufferStatus(GL_FRAMEBUFFER);
-    Log.warn("PortMaster SDL presenter context={} owns={} sdl2Window={} sdl2Context={} eglDisplay={} eglSurface={} "
+    Log.warn("PortMaster SDL presenter context={} owns={} borrowed={} ownEnv={} borrowEnv={} "
+             "sdl2Window={} sdl2Context={} eglDisplay={} eglSurface={} "
              "sdl2MakeCurrent={} eglMakeCurrent={} sdl2Swap={} currentWindow={} currentContext={} "
              "window={}x{} pixels={}x{} viewport={}x{}+{},{} "
              "framebuffer={} status={} ({:#x})",
-             static_cast<const void*>(g_sdlState.context), g_sdlState.ownsContext,
+             static_cast<const void*>(g_sdlState.context), g_sdlState.ownsContext, g_sdlState.borrowedSdl2Context,
+             std::getenv("DUSKLIGHT_PORTMASTER_SDL_PRESENTER_OWN_CONTEXT") != nullptr,
+             std::getenv("DUSKLIGHT_PORTMASTER_SDL_PRESENTER_BORROW_CONTEXT") != nullptr,
              g_sdlState.sdl2Window, g_sdlState.sdl2Context, g_sdlState.sdl2EglDisplay, g_sdlState.sdl2EglSurface,
              reinterpret_cast<const void*>(g_sdl2GlMakeCurrent), reinterpret_cast<const void*>(g_sdl2EglMakeCurrent),
              reinterpret_cast<const void*>(g_sdl2GlSwapWindow),
@@ -862,9 +883,43 @@ bool ensure_context() {
   return true;
 }
 
+bool ensure_renderer() {
+  SDL_Window* sdlWindow = window::get_sdl_window();
+  if (sdlWindow == nullptr) {
+    return false;
+  }
+  if (g_sdlState.renderer == nullptr) {
+    g_sdlState.renderer = SDL_CreateRenderer(sdlWindow, nullptr);
+    if (g_sdlState.renderer == nullptr) {
+      Log.warn("PortMaster SDL renderer presenter failed to create renderer: {}", SDL_GetError());
+      return false;
+    }
+    SDL_SetRenderVSync(g_sdlState.renderer, 0);
+  }
+  if (!g_sdlState.loggedRenderer) {
+    int winW = 0;
+    int winH = 0;
+    int pixelW = 0;
+    int pixelH = 0;
+    SDL_GetWindowSize(sdlWindow, &winW, &winH);
+    SDL_GetWindowSizeInPixels(sdlWindow, &pixelW, &pixelH);
+    Log.warn("PortMaster SDL renderer presenter active renderer='{}' window={}x{} pixels={}x{}",
+             SDL_GetRendererName(g_sdlState.renderer), winW, winH, pixelW, pixelH);
+    g_sdlState.loggedRenderer = true;
+  }
+  return true;
+}
+
 void shutdown() {
+  if (g_sdlState.rendererTexture != nullptr) {
+    SDL_DestroyTexture(g_sdlState.rendererTexture);
+  }
+  if (g_sdlState.renderer != nullptr) {
+    SDL_DestroyRenderer(g_sdlState.renderer);
+  }
   if (g_sdlState.context != nullptr && window::get_sdl_window() != nullptr) {
-    if (g_sdl2GlMakeCurrent != nullptr && g_sdlState.sdl2Window != nullptr && g_sdlState.sdl2Context != nullptr) {
+    if (g_sdlState.borrowedSdl2Context && g_sdl2GlMakeCurrent != nullptr && g_sdlState.sdl2Window != nullptr &&
+        g_sdlState.sdl2Context != nullptr) {
       g_sdl2GlMakeCurrent(g_sdlState.sdl2Window, g_sdlState.sdl2Context);
       if (g_sdl2EglMakeCurrent != nullptr && g_sdlState.sdl2EglDisplay != nullptr &&
           g_sdlState.sdl2EglSurface != nullptr) {
@@ -1006,6 +1061,59 @@ bool draw_pixels(const uint8_t* data) {
   return true;
 }
 
+bool draw_pixels_renderer(const uint8_t* data) {
+  if (!ensure_renderer()) {
+    return false;
+  }
+  const uint32_t width = g_sdlState.readbackWidth;
+  const uint32_t height = g_sdlState.readbackHeight;
+  if (g_sdlState.rendererTexture == nullptr || g_sdlState.rendererTextureWidth != width ||
+      g_sdlState.rendererTextureHeight != height) {
+    if (g_sdlState.rendererTexture != nullptr) {
+      SDL_DestroyTexture(g_sdlState.rendererTexture);
+      g_sdlState.rendererTexture = nullptr;
+    }
+    g_sdlState.rendererTexture =
+        SDL_CreateTexture(g_sdlState.renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
+                          static_cast<int>(width), static_cast<int>(height));
+    if (g_sdlState.rendererTexture == nullptr) {
+      Log.warn("PortMaster SDL renderer presenter failed to create texture: {}", SDL_GetError());
+      return false;
+    }
+    SDL_SetTextureScaleMode(g_sdlState.rendererTexture, SDL_SCALEMODE_LINEAR);
+    g_sdlState.rendererTextureWidth = width;
+    g_sdlState.rendererTextureHeight = height;
+  }
+  if (reinterpret_cast<uintptr_t>(data) < 65536u) {
+    Log.warn("PortMaster SDL renderer presenter readback pointer looked invalid: {}", static_cast<const void*>(data));
+    return false;
+  }
+  if (!SDL_UpdateTexture(g_sdlState.rendererTexture, nullptr, data, static_cast<int>(g_sdlState.readbackStride))) {
+    Log.warn("PortMaster SDL renderer presenter UpdateTexture failed: {}", SDL_GetError());
+    return false;
+  }
+  int pixelW = 0;
+  int pixelH = 0;
+  SDL_GetWindowSizeInPixels(window::get_sdl_window(), &pixelW, &pixelH);
+  SDL_SetRenderDrawColor(g_sdlState.renderer, 0, 0, 0, 255);
+  SDL_RenderClear(g_sdlState.renderer);
+  const SDL_FRect dst{
+      .x = 0.f,
+      .y = 0.f,
+      .w = static_cast<float>(pixelW),
+      .h = static_cast<float>(pixelH),
+  };
+  if (!SDL_RenderTexture(g_sdlState.renderer, g_sdlState.rendererTexture, nullptr, &dst)) {
+    Log.warn("PortMaster SDL renderer presenter RenderTexture failed: {}", SDL_GetError());
+    return false;
+  }
+  if (!SDL_RenderPresent(g_sdlState.renderer)) {
+    Log.warn("PortMaster SDL renderer presenter RenderPresent failed: {}", SDL_GetError());
+    return false;
+  }
+  return true;
+}
+
 void present_after_submit() {
   if (!enabled() || !g_sdlState.readback) {
     return;
@@ -1032,15 +1140,17 @@ void present_after_submit() {
   }
   const auto* data = static_cast<const uint8_t*>(g_sdlState.readback.GetConstMappedRange(0, byteSize));
   const auto drawStart = Clock::now();
-  if (data != nullptr && ensure_context()) {
-    if (draw_pixels(data)) {
-      if (g_sdl2GlSwapWindow != nullptr && g_sdlState.sdl2Window != nullptr) {
+  if (data != nullptr) {
+    if (renderer_enabled()) {
+      draw_pixels_renderer(data);
+    } else if (ensure_context() && draw_pixels(data)) {
+      if (g_sdlState.borrowedSdl2Context && g_sdl2GlSwapWindow != nullptr && g_sdlState.sdl2Window != nullptr) {
         g_sdl2GlSwapWindow(g_sdlState.sdl2Window);
       } else if (!SDL_GL_SwapWindow(window::get_sdl_window())) {
         Log.warn("PortMaster SDL presenter SwapWindow failed: {}", SDL_GetError());
       }
+      clear_gl_errors("after-swap");
     }
-    clear_gl_errors("after-swap");
   }
   const auto drawDone = Clock::now();
   portmaster_fbdev::note_fbdev_timing(elapsed_us(mapStart, mapQueued), elapsed_us(mapQueued, waitDone),
