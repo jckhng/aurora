@@ -264,6 +264,7 @@ template <typename T>
 static Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 }
+bool uniform_ranges_equal_skipping_prefix(Range lhs, Range rhs, uint32_t skipBytes) noexcept;
 Range push_storage(const uint8_t* data, size_t length);
 template <typename T>
 static Range push_storage(ArrayRef<T> data) {

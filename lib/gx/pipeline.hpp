@@ -14,6 +14,8 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   uint32_t dstAlpha;
+  GXPrimitive primitive;
+  GXVtxFmt vtxFmt;
   bool nativeVertexFetch;
   bool textureVertexFetch;
   bool triangleStripTopology;

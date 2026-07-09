@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
@@ -522,6 +524,13 @@ static void load_pipeline_cache_entries(ShaderType type, uint32_t configVersion,
     std::memcpy(&config, configBlob, sizeof(config));
     if (config.version != configVersion) {
       continue;
+    }
+    if constexpr (std::is_same_v<PipelineConfig, gx::PipelineConfig>) {
+      const char* forceTexture = std::getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE");
+      if (forceTexture != nullptr && forceTexture[0] != '\0' && forceTexture[0] != '0' &&
+          !config.shaderConfig.textureVertexFetch) {
+        continue;
+      }
     }
 
     find_pipeline_impl(type, config, [=] { return create(config); }, false, firstFrameUsed);

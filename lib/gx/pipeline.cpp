@@ -5,6 +5,8 @@
 #include "shader_info.hpp"
 #include "tracy/Tracy.hpp"
 
+#include <cstdlib>
+
 namespace aurora::gx {
 static Module Log("aurora::gx");
 
@@ -68,12 +70,22 @@ enum class Group0Binding : u8 {
 Group0Binding s_boundGroup0 = Group0Binding::Static;
 bool s_boundTextureGroupEmpty = true;
 gfx::BindGroupRef s_boundTextureGroup = 0;
+bool s_boundFullIndexBuffer = false;
+
+bool portmaster_bind_full_index_buffer_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_BIND_FULL_INDEX_BUFFER");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
 } // namespace
 
 void reset_render_state() noexcept {
   s_boundGroup0 = Group0Binding::Static;
   s_boundTextureGroupEmpty = true;
   s_boundTextureGroup = 0;
+  s_boundFullIndexBuffer = false;
 }
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
@@ -104,8 +116,15 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
   if (data.idxRange.size == 0) {
     pass.Draw(data.indexCount, data.instanceCount);
+  } else if (data.textureVertexFetch && portmaster_bind_full_index_buffer_enabled()) {
+    if (!s_boundFullIndexBuffer) {
+      pass.SetIndexBuffer(gfx::g_indexBuffer, wgpu::IndexFormat::Uint16, 0, gfx::IndexBufferSize);
+      s_boundFullIndexBuffer = true;
+    }
+    pass.DrawIndexed(data.indexCount, data.instanceCount, data.idxRange.offset / sizeof(u16));
   } else {
     pass.SetIndexBuffer(gfx::g_indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+    s_boundFullIndexBuffer = false;
     pass.DrawIndexed(data.indexCount, data.instanceCount);
   }
 }

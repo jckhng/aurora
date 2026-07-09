@@ -6,6 +6,7 @@
 #include "depth_peek.hpp"
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
+#include "../gx/gx_fmt.hpp"
 #include "../gx/pipeline.hpp"
 #include "pipeline_cache.hpp"
 #include "tex_copy_conv.hpp"
@@ -15,6 +16,7 @@
 #include "../window.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <optional>
@@ -163,6 +165,10 @@ static uint64_t s_timingMaxFrameUs = 0;
 static uint32_t s_portmasterCachedVertexOffset = PortmasterVertexCacheOffset;
 static uint32_t s_portmasterCachedIndexOffset = PortmasterIndexCacheOffset;
 
+static uint64_t portmaster_elapsed_us(Clock::time_point start) noexcept {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
+}
+
 static bool portmaster_timing_enabled() noexcept {
   const char* disabled = std::getenv("DUSKLIGHT_PORTMASTER_TIMING");
   if (disabled != nullptr && disabled[0] == '0') {
@@ -174,6 +180,54 @@ static bool portmaster_timing_enabled() noexcept {
          std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") != nullptr ||
          std::getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
 }
+
+static bool portmaster_upload_stats_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_UPLOAD_STATS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+static bool portmaster_force_vertex_texture_enabled() noexcept {
+  return std::getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
+}
+
+static bool portmaster_skip_vertex_buffer_copy_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_SKIP_VERTEX_BUFFER_COPY");
+    return value == nullptr || value[0] == '\0' || value[0] != '0';
+  }();
+  return enabled;
+}
+
+struct PortmasterUploadStats {
+  uint64_t frames = 0;
+  uint64_t pushVertCalls = 0;
+  uint64_t pushVertBytes = 0;
+  uint64_t pushVertUs = 0;
+  uint64_t pushIndexCalls = 0;
+  uint64_t pushIndexBytes = 0;
+  uint64_t pushIndexUs = 0;
+  uint64_t copyVertexBufferBytes = 0;
+  uint64_t copyVertexBufferUs = 0;
+  uint64_t skippedVertexBufferBytes = 0;
+  uint64_t copyIndexBufferBytes = 0;
+  uint64_t copyIndexBufferUs = 0;
+  uint64_t copyStorageBufferBytes = 0;
+  uint64_t copyStorageBufferUs = 0;
+  uint64_t copyVertexTextureBytes = 0;
+  uint64_t copyVertexTextureUs = 0;
+  uint64_t copyStorageTextureBytes = 0;
+  uint64_t copyStorageTextureUs = 0;
+  uint64_t cacheVertexBytes = 0;
+  uint64_t cacheVertexWriteBufferUs = 0;
+  uint64_t cacheVertexWriteTextureUs = 0;
+  uint64_t cacheIndexBytes = 0;
+  uint64_t cacheIndexWriteBufferUs = 0;
+};
+
+static PortmasterUploadStats s_portmasterUploadStats;
 
 static std::string format_top_bp_dirty_regs(const std::array<uint64_t, 256>& counts) {
   std::array<std::pair<uint64_t, uint8_t>, 6> top{};
@@ -239,6 +293,9 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
   if (!portmaster_timing_enabled()) {
     return;
   }
+  if (portmaster_upload_stats_enabled()) {
+    ++s_portmasterUploadStats.frames;
+  }
   ++s_timingFrames;
   s_timingFrameUs += frameUs;
   s_timingMaxFrameUs = std::max(s_timingMaxFrameUs, frameUs);
@@ -258,7 +315,7 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
   const auto bpTop = format_top_bp_dirty_regs(gxStats.bpDirtyRegCounts);
   const auto xfTop = format_top_xf_dirty_addrs(gxStats.xfDirtyAddrCounts);
   const auto xfBlockTop = format_top_xf_dirty_addrs(gxStats.xfBlockAddrCounts);
-  Log.info("PortMaster timing: fps={:.2f} frames={} avg_cpu_frame_ms={:.1f} max_cpu_frame_ms={:.1f} draws_last={} uploads[v={} i={} s={}] gx_draws[tex={} cpu={} native={} storage={}] gx_bytes[fifo={} native={}] gx_index[noidx={} idx={} avoided={} bytes={} cache_hit={} cache_miss={}] gx_merge[try={} ok={} dirty={} none={} line={} inst={} tex={} idx={}] gx_dirty[bp={} xf={} cp={} arr={} tex={} other={} clear_skip={} cp_skip={} xf_skip={}] gx_bp[tev={} tref={} render={} tc={} ind={} fog={} reg={} tex={} other={}] gx_bp_top[{}] gx_xf[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_block[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_top[{}] gx_xf_block_top[{}] gx_batch[strip_runs={} strip_draws={} strip_vtx={} strip_max={} quad_runs={} quad_draws={} quad_vtx={} quad_max={}] gx_reuse[cand={} hit={} miss={} same={} cross={} bytes={} avoid={} cache_hit={} cache_miss={} cache_up={} cache_full={} cache_v={} cache_i={}] gx_prim[q={} tri={} strip={} fan={} line={} lstrip={} point={} other={} vtx={}] dl_opt[try={} ok={} fail={} in={} out={} saved={} pass={} draw={} preidx={} q={} tri={} strip={} fan={} unexp={} out_tri={} out_idx={} batch_runs={} batch_draws={} batch_vtx={} batch_max={}]",
+  Log.info("PortMaster timing: fps={:.2f} frames={} avg_cpu_frame_ms={:.1f} max_cpu_frame_ms={:.1f} draws_last={} uploads[v={} i={} s={}] gx_draws[tex={} cpu={} native={} storage={}] gx_bytes[fifo={} native={}] gx_index[noidx={} idx={} avoided={} bytes={} cache_hit={} cache_miss={}] gx_merge[try={} ok={} dirty={} none={} line={} inst={} tex={} idx={}] gx_dirty[bp={} xf={} cp={} arr={} tex={} other={} clear_skip={} cp_skip={} xf_skip={} tex_load_skip={} tlut_skip={}] dirty_probe[cand={} none={} prim={} pipe={} bind={} usize={} usame={} udiff={} could={}] gx_bp[tev={} tref={} render={} tc={} ind={} fog={} reg={} tex={} other={}] gx_bp_top[{}] gx_xf[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_block[pos={} tex={} nrm={} pttex={} light={} chan={} mtxidx={} view={} proj={} texgen={} other={}] gx_xf_top[{}] gx_xf_block_top[{}] gx_batch[strip_runs={} strip_draws={} strip_vtx={} strip_max={} quad_runs={} quad_draws={} quad_vtx={} quad_max={}] gx_reuse[cand={} hit={} miss={} same={} cross={} bytes={} avoid={} cache_hit={} cache_miss={} cache_up={} cache_full={} cache_v={} cache_i={}] gx_prim[q={} tri={} strip={} fan={} line={} lstrip={} point={} other={} vtx={}] dl_opt[try={} ok={} fail={} in={} out={} saved={} pass={} draw={} preidx={} q={} tri={} strip={} fan={} unexp={} out_tri={} out_idx={} batch_runs={} batch_draws={} batch_vtx={} batch_max={}]",
            fps, s_timingFrames, avgFrameMs, maxFrameMs, drawCount, vertexWriteSize, indexWriteSize, storageWriteSize,
            gxStats.textureVertexDraws, gxStats.cpuGenericDraws, gxStats.directNativeDraws, gxStats.storageVertexDraws,
            gxStats.fifoBytes, gxStats.nativeBytes, gxStats.noIndexTriangleDraws, gxStats.indexedPrimitiveDraws,
@@ -268,7 +325,12 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
            gxStats.mergeBlockedInstance, gxStats.mergeBlockedTextureMode, gxStats.mergeBlockedIndexMode,
            gxStats.mergeDirtyBp, gxStats.mergeDirtyXf, gxStats.mergeDirtyCp, gxStats.mergeDirtyArray,
            gxStats.mergeDirtyTexture, gxStats.mergeDirtyOther, gxStats.bpClearStateSkips,
-           gxStats.cpDuplicateSkips, gxStats.xfDuplicateSkips,
+           gxStats.cpDuplicateSkips, gxStats.xfDuplicateSkips, gxStats.textureLoadSkips, gxStats.tlutLoadSkips,
+           gxStats.dirtyMergeProbeCandidates, gxStats.dirtyMergeProbeNoPrevious,
+           gxStats.dirtyMergeProbePrimitive, gxStats.dirtyMergeProbePipeline,
+           gxStats.dirtyMergeProbeBind, gxStats.dirtyMergeProbeUniformSize,
+           gxStats.dirtyMergeProbeUniformSame, gxStats.dirtyMergeProbeUniformDifferent,
+           gxStats.dirtyMergeProbeCouldMerge,
            gxStats.bpDirtyTevCombiner, gxStats.bpDirtyTevOrder, gxStats.bpDirtyRenderState,
            gxStats.bpDirtyTexCoord, gxStats.bpDirtyIndTex, gxStats.bpDirtyFog, gxStats.bpDirtyTevReg,
            gxStats.bpDirtyTexture, gxStats.bpDirtyOther, bpTop,
@@ -292,6 +354,40 @@ static void note_portmaster_frame_timing(uint64_t frameUs, size_t vertexWriteSiz
            dlStats.inputTriangleFans, dlStats.unexpandedDraws, dlStats.outputTriangleDraws,
            dlStats.outputIndexedDraws, dlStats.batchRuns, dlStats.batchDraws, dlStats.batchVertices,
            dlStats.batchMaxDraws);
+
+  if (gxStats.drawSetupCalls > 0) {
+    const auto ms = [](uint64_t us) { return static_cast<double>(us) / 1000.0; };
+    Log.info("PortMaster draw_setup: calls={} total_ms={:.2f} avg_us={:.1f} index_ms={:.2f} array_ms={:.2f} config_ms={:.2f} info_ms={:.2f} texture_ms={:.2f} bind_ms={:.2f} pipeline_ms={:.2f} uniform_ms={:.2f} push_ms={:.2f} pipe_ref[last_hit={} local_hit={} miss={} cache={}]",
+             gxStats.drawSetupCalls, ms(gxStats.drawSetupTotalUs),
+             static_cast<double>(gxStats.drawSetupTotalUs) / static_cast<double>(gxStats.drawSetupCalls),
+             ms(gxStats.drawSetupIndexUs), ms(gxStats.drawSetupArrayUs), ms(gxStats.drawSetupConfigUs),
+             ms(gxStats.drawSetupInfoUs), ms(gxStats.drawSetupTextureUs), ms(gxStats.drawSetupBindUs),
+             ms(gxStats.drawSetupPipelineUs), ms(gxStats.drawSetupUniformUs), ms(gxStats.drawSetupPushUs),
+             gxStats.pipelineFastPathHits, gxStats.pipelineRefCacheHits, gxStats.pipelineRefCacheMisses,
+             gxStats.pipelineRefCacheSize);
+  }
+
+  if (portmaster_upload_stats_enabled()) {
+    const auto avg = [](uint64_t total, uint64_t count) {
+      return count > 0 ? static_cast<double>(total) / static_cast<double>(count) : 0.0;
+    };
+    Log.info("PortMaster upload_stats: frames={} push_v[calls={} bytes={} avg_us={:.1f}] push_i[calls={} bytes={} avg_us={:.1f}] encode_copy[vbuf_bytes={} vbuf_us={} vbuf_skip={} ibuf_bytes={} ibuf_us={} sbuf_bytes={} sbuf_us={} vtex_bytes={} vtex_us={} stex_bytes={} stex_us={}] cache[v_bytes={} v_wbuf_us={} v_wtex_us={} i_bytes={} i_wbuf_us={}]",
+             s_portmasterUploadStats.frames, s_portmasterUploadStats.pushVertCalls,
+             s_portmasterUploadStats.pushVertBytes,
+             avg(s_portmasterUploadStats.pushVertUs, s_portmasterUploadStats.pushVertCalls),
+             s_portmasterUploadStats.pushIndexCalls, s_portmasterUploadStats.pushIndexBytes,
+             avg(s_portmasterUploadStats.pushIndexUs, s_portmasterUploadStats.pushIndexCalls),
+             s_portmasterUploadStats.copyVertexBufferBytes, s_portmasterUploadStats.copyVertexBufferUs,
+             s_portmasterUploadStats.skippedVertexBufferBytes,
+             s_portmasterUploadStats.copyIndexBufferBytes, s_portmasterUploadStats.copyIndexBufferUs,
+             s_portmasterUploadStats.copyStorageBufferBytes, s_portmasterUploadStats.copyStorageBufferUs,
+             s_portmasterUploadStats.copyVertexTextureBytes, s_portmasterUploadStats.copyVertexTextureUs,
+             s_portmasterUploadStats.copyStorageTextureBytes, s_portmasterUploadStats.copyStorageTextureUs,
+             s_portmasterUploadStats.cacheVertexBytes, s_portmasterUploadStats.cacheVertexWriteBufferUs,
+             s_portmasterUploadStats.cacheVertexWriteTextureUs, s_portmasterUploadStats.cacheIndexBytes,
+             s_portmasterUploadStats.cacheIndexWriteBufferUs);
+    s_portmasterUploadStats = {};
+  }
 
   s_timingIntervalStart = now;
   s_timingFrames = 0;
@@ -329,6 +425,246 @@ static Viewport g_suspendedEfbViewport;
 static ClipRect g_suspendedEfbScissor;
 static webgpu::TextureWithSampler g_offscreenColor;
 static webgpu::TextureWithSampler g_offscreenDepth;
+
+static uint32_t portmaster_env_u32(const char* name, uint32_t fallback) noexcept {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (end == value) {
+    return fallback;
+  }
+  return static_cast<uint32_t>(parsed);
+}
+
+static bool portmaster_frame_capture_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_FRAME_CAPTURE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+static uint32_t portmaster_frame_capture_after() noexcept {
+  static const uint32_t after = portmaster_env_u32("DUSKLIGHT_PORTMASTER_FRAME_CAPTURE_AFTER", 1);
+  return after;
+}
+
+static uint32_t portmaster_frame_capture_top_count() noexcept {
+  static const uint32_t count = std::clamp(portmaster_env_u32("DUSKLIGHT_PORTMASTER_FRAME_CAPTURE_TOP", 12), 1u, 32u);
+  return count;
+}
+
+static bool s_portmasterFrameCaptureDone = false;
+
+struct PortmasterDrawSignature {
+  PipelineRef pipeline = 0;
+  BindGroupRef textureBindGroup = 0;
+  uint32_t primitive = 0;
+  uint32_t vtxFmt = 0;
+  bool indexed = false;
+  bool nativeVertexFetch = false;
+  bool textureVertexFetch = false;
+  bool triangleStripTopology = false;
+  bool dstAlpha = false;
+
+  bool operator==(const PortmasterDrawSignature& rhs) const noexcept {
+    return pipeline == rhs.pipeline && textureBindGroup == rhs.textureBindGroup && primitive == rhs.primitive &&
+           vtxFmt == rhs.vtxFmt && indexed == rhs.indexed && nativeVertexFetch == rhs.nativeVertexFetch &&
+           textureVertexFetch == rhs.textureVertexFetch && triangleStripTopology == rhs.triangleStripTopology &&
+           dstAlpha == rhs.dstAlpha;
+  }
+
+  template <typename H>
+  friend H AbslHashValue(H h, const PortmasterDrawSignature& key) {
+    return H::combine(std::move(h), key.pipeline, key.textureBindGroup, key.primitive, key.vtxFmt, key.indexed,
+                      key.nativeVertexFetch, key.textureVertexFetch, key.triangleStripTopology, key.dstAlpha);
+  }
+};
+
+struct PortmasterDrawBucket {
+  PortmasterDrawSignature key{};
+  uint64_t draws = 0;
+  uint64_t vertices = 0;
+  uint64_t indices = 0;
+  uint64_t vertexBytes = 0;
+  uint64_t indexBytes = 0;
+  uint32_t maxVertices = 0;
+  uint32_t maxIndices = 0;
+};
+
+struct PortmasterFrameCapture {
+  uint32_t passes = 0;
+  uint32_t offscreenPasses = 0;
+  uint32_t resolvePasses = 0;
+  uint32_t paletteConversions = 0;
+  uint32_t commands = 0;
+  uint32_t viewportCommands = 0;
+  uint32_t scissorCommands = 0;
+  uint32_t drawCommands = 0;
+  uint32_t clearDraws = 0;
+  uint32_t gxDraws = 0;
+  uint32_t indexedDraws = 0;
+  uint32_t nonIndexedDraws = 0;
+  uint32_t nativeVertexDraws = 0;
+  uint32_t textureVertexDraws = 0;
+  uint32_t stripTopologyDraws = 0;
+  uint32_t pipelineSwitches = 0;
+  uint32_t textureBindGroupSwitches = 0;
+  uint32_t group0Switches = 0;
+  uint64_t vertices = 0;
+  uint64_t indices = 0;
+  uint64_t vertexBytes = 0;
+  uint64_t indexBytes = 0;
+  absl::flat_hash_map<PortmasterDrawSignature, PortmasterDrawBucket> buckets;
+};
+
+static std::string portmaster_primitive_name(uint32_t primitive) {
+  return format_as(static_cast<GXPrimitive>(primitive));
+}
+
+static void portmaster_note_frame_capture_draw(PortmasterFrameCapture& capture, const gx::DrawData& draw,
+                                               PipelineRef& lastPipeline, BindGroupRef& lastTextureBindGroup,
+                                               bool& lastGroup0TextureVertex, bool& haveLastGroup0) {
+  ++capture.gxDraws;
+  ++capture.drawCommands;
+  capture.vertices += draw.vtxCount;
+  capture.indices += draw.indexCount;
+  capture.vertexBytes += draw.vertRange.size;
+  capture.indexBytes += draw.idxRange.size;
+  if (draw.idxRange.size > 0) {
+    ++capture.indexedDraws;
+  } else {
+    ++capture.nonIndexedDraws;
+  }
+  if (draw.nativeVertexFetch) {
+    ++capture.nativeVertexDraws;
+  }
+  if (draw.textureVertexFetch) {
+    ++capture.textureVertexDraws;
+  }
+  if (draw.triangleStripTopology) {
+    ++capture.stripTopologyDraws;
+  }
+  if (lastPipeline != draw.pipeline) {
+    ++capture.pipelineSwitches;
+    lastPipeline = draw.pipeline;
+  }
+  if (lastTextureBindGroup != draw.bindGroups.textureBindGroup) {
+    ++capture.textureBindGroupSwitches;
+    lastTextureBindGroup = draw.bindGroups.textureBindGroup;
+  }
+  if (!haveLastGroup0 || lastGroup0TextureVertex != draw.textureVertexFetch) {
+    ++capture.group0Switches;
+    lastGroup0TextureVertex = draw.textureVertexFetch;
+    haveLastGroup0 = true;
+  }
+
+  const PortmasterDrawSignature key{
+      .pipeline = draw.pipeline,
+      .textureBindGroup = draw.bindGroups.textureBindGroup,
+      .primitive = static_cast<uint32_t>(draw.primitive),
+      .vtxFmt = static_cast<uint32_t>(draw.vtxFmt),
+      .indexed = draw.idxRange.size > 0,
+      .nativeVertexFetch = draw.nativeVertexFetch,
+      .textureVertexFetch = draw.textureVertexFetch,
+      .triangleStripTopology = draw.triangleStripTopology,
+      .dstAlpha = draw.dstAlpha != UINT32_MAX,
+  };
+  auto& bucket = capture.buckets[key];
+  if (bucket.draws == 0) {
+    bucket.key = key;
+  }
+  ++bucket.draws;
+  bucket.vertices += draw.vtxCount;
+  bucket.indices += draw.indexCount;
+  bucket.vertexBytes += draw.vertRange.size;
+  bucket.indexBytes += draw.idxRange.size;
+  bucket.maxVertices = std::max(bucket.maxVertices, draw.vtxCount);
+  bucket.maxIndices = std::max(bucket.maxIndices, draw.indexCount);
+}
+
+static void portmaster_maybe_capture_frame_commands() {
+  if (!portmaster_frame_capture_enabled() || s_portmasterFrameCaptureDone || g_frameIndex < portmaster_frame_capture_after()) {
+    return;
+  }
+
+  PortmasterFrameCapture capture{};
+  PipelineRef lastPipeline = UINTPTR_MAX;
+  BindGroupRef lastTextureBindGroup = 0;
+  bool lastGroup0TextureVertex = false;
+  bool haveLastGroup0 = false;
+
+  capture.passes = static_cast<uint32_t>(g_renderPasses.size());
+  for (const auto& passInfo : g_renderPasses) {
+    capture.paletteConversions += static_cast<uint32_t>(passInfo.paletteConvs.size());
+    capture.commands += static_cast<uint32_t>(passInfo.commands.size());
+    if (passInfo.resolveTarget) {
+      ++capture.resolvePasses;
+    }
+    if (passInfo.resolveTarget) {
+      ++capture.offscreenPasses;
+    }
+    for (const auto& command : passInfo.commands) {
+      switch (command.type) {
+      case CommandType::SetViewport:
+        ++capture.viewportCommands;
+        break;
+      case CommandType::SetScissor:
+        ++capture.scissorCommands;
+        break;
+      case CommandType::Draw:
+        switch (command.data.draw.type) {
+        case ShaderType::Clear:
+          ++capture.clearDraws;
+          ++capture.drawCommands;
+          break;
+        case ShaderType::GX:
+          portmaster_note_frame_capture_draw(capture, command.data.draw.gx, lastPipeline, lastTextureBindGroup,
+                                             lastGroup0TextureVertex, haveLastGroup0);
+          break;
+        }
+        break;
+      case CommandType::DebugMarker:
+        break;
+      }
+    }
+  }
+
+  std::vector<PortmasterDrawBucket> buckets;
+  buckets.reserve(capture.buckets.size());
+  for (const auto& [_, bucket] : capture.buckets) {
+    buckets.push_back(bucket);
+  }
+  std::ranges::sort(buckets, [](const PortmasterDrawBucket& lhs, const PortmasterDrawBucket& rhs) {
+    if (lhs.draws != rhs.draws) {
+      return lhs.draws > rhs.draws;
+    }
+    return lhs.vertexBytes > rhs.vertexBytes;
+  });
+
+  Log.info("PortMaster frame_capture: frame={} passes={} offscreen={} resolves={} palette={} commands={} draws={} clear={} gx={} indexed={} nonindexed={} native={} texvertex={} striptopo={} switches[pipeline={} tex={} group0={}] totals[vtx={} idx={} vbytes={} ibytes={}] unique_signatures={}",
+           g_frameIndex, capture.passes, capture.offscreenPasses, capture.resolvePasses, capture.paletteConversions,
+           capture.commands, capture.drawCommands, capture.clearDraws, capture.gxDraws, capture.indexedDraws,
+           capture.nonIndexedDraws, capture.nativeVertexDraws, capture.textureVertexDraws, capture.stripTopologyDraws,
+           capture.pipelineSwitches, capture.textureBindGroupSwitches, capture.group0Switches, capture.vertices,
+           capture.indices, capture.vertexBytes, capture.indexBytes, buckets.size());
+
+  const uint32_t topCount = std::min<uint32_t>(portmaster_frame_capture_top_count(), buckets.size());
+  for (uint32_t i = 0; i < topCount; ++i) {
+    const auto& bucket = buckets[i];
+    Log.info("PortMaster frame_capture_top[{}]: prim={} fmt={} draws={} vtx={} idx={} vbytes={} ibytes={} max[vtx={} idx={}] pipeline={:016x} texbg={:016x} mode={}{}{}{}",
+             i, portmaster_primitive_name(bucket.key.primitive), bucket.key.vtxFmt, bucket.draws, bucket.vertices,
+             bucket.indices, bucket.vertexBytes, bucket.indexBytes, bucket.maxVertices, bucket.maxIndices,
+             bucket.key.pipeline, bucket.key.textureBindGroup, bucket.key.textureVertexFetch ? "texvertex" : "native",
+             bucket.key.indexed ? "+indexed" : "+draw", bucket.key.triangleStripTopology ? "+striptopo" : "",
+             bucket.key.dstAlpha ? "+dstalpha" : "");
+  }
+
+  s_portmasterFrameCaptureDone = true;
+}
 
 static void set_efb_targets(RenderPass& pass) {
   pass.colorView = webgpu::g_frameBuffer.view;
@@ -947,7 +1283,21 @@ void end_frame(const wgpu::CommandEncoder& cmd) {
   const auto writeBuffer = [&](ByteBuffer& buf, wgpu::Buffer& out, uint64_t size, std::string_view label) {
     const auto writeSize = buf.size(); // Only need to copy this many bytes
     if (writeSize > 0) {
+      const auto copyStart = Clock::now();
       cmd.CopyBufferToBuffer(g_stagingBuffers[currentStagingBuffer], bufferOffset, out, 0, AURORA_ALIGN(writeSize, 4));
+      const uint64_t copyUs = portmaster_elapsed_us(copyStart);
+      if (portmaster_upload_stats_enabled()) {
+        if (label == "Vertex") {
+          s_portmasterUploadStats.copyVertexBufferBytes += writeSize;
+          s_portmasterUploadStats.copyVertexBufferUs += copyUs;
+        } else if (label == "Index") {
+          s_portmasterUploadStats.copyIndexBufferBytes += writeSize;
+          s_portmasterUploadStats.copyIndexBufferUs += copyUs;
+        } else if (label == "Storage") {
+          s_portmasterUploadStats.copyStorageBufferBytes += writeSize;
+          s_portmasterUploadStats.copyStorageBufferUs += copyUs;
+        }
+      }
       buf.release();
     }
     bufferOffset += size;
@@ -960,7 +1310,18 @@ void end_frame(const wgpu::CommandEncoder& cmd) {
   const auto vertexWriteSize = g_verts.size();
   const auto indexWriteSize = g_indices.size();
   const auto storageWriteSize = g_storage.size();
-  g_stats.lastVertSize = writeBuffer(g_verts, g_vertexBuffer, VertexBufferSize, "Vertex");
+  const bool skipVertexBufferCopy =
+      portmaster_force_vertex_texture_enabled() && portmaster_skip_vertex_buffer_copy_enabled();
+  if (skipVertexBufferCopy) {
+    if (portmaster_upload_stats_enabled()) {
+      s_portmasterUploadStats.skippedVertexBufferBytes += vertexWriteSize;
+    }
+    g_verts.release();
+    bufferOffset += VertexBufferSize;
+    g_stats.lastVertSize = 0;
+  } else {
+    g_stats.lastVertSize = writeBuffer(g_verts, g_vertexBuffer, VertexBufferSize, "Vertex");
+  }
   g_stats.lastUniformSize = writeBuffer(g_uniforms, g_uniformBuffer, UniformBufferSize, "Uniform");
   g_stats.lastIndexSize = writeBuffer(g_indices, g_indexBuffer, IndexBufferSize, "Index");
   g_stats.lastStorageSize = writeBuffer(g_storage, g_storageBuffer, StorageBufferSize, "Storage");
@@ -986,7 +1347,18 @@ void end_frame(const wgpu::CommandEncoder& cmd) {
         .height = rows,
         .depthOrArrayLayers = 1,
     };
+    const auto copyStart = Clock::now();
     cmd.CopyBufferToTexture(&src, &dst, &size);
+    const uint64_t copyUs = portmaster_elapsed_us(copyStart);
+    if (portmaster_upload_stats_enabled()) {
+      if (&texture == &g_vertexDataTexture) {
+        s_portmasterUploadStats.copyVertexTextureBytes += writeSize;
+        s_portmasterUploadStats.copyVertexTextureUs += copyUs;
+      } else if (&texture == &g_storageDataTexture) {
+        s_portmasterUploadStats.copyStorageTextureBytes += writeSize;
+        s_portmasterUploadStats.copyStorageTextureUs += copyUs;
+      }
+    }
   };
   copyDataTexture(g_vertexDataTexture, 0, vertexWriteSize);
   copyDataTexture(g_storageDataTexture, VertexBufferSize + UniformBufferSize + IndexBufferSize, storageWriteSize);
@@ -1042,6 +1414,7 @@ static void expire_cached_bind_groups() {
 
 void render(wgpu::CommandEncoder& cmd) {
   ZoneScoped;
+  portmaster_maybe_capture_frame_commands();
   for (u32 i = 0; i < g_renderPasses.size(); ++i) {
     const auto& passInfo = g_renderPasses[i];
     for (const auto& conv : passInfo.paletteConvs) {
@@ -1271,8 +1644,26 @@ static inline Range map(ByteBuffer& target, size_t length, size_t alignment) {
   target.append_zeroes(length + padding);
   return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length + padding)};
 }
-Range push_verts(const uint8_t* data, size_t length) { return push(g_verts, data, length, 0); }
-Range push_indices(const uint8_t* data, size_t length) { return push(g_indices, data, length, 0); }
+Range push_verts(const uint8_t* data, size_t length) {
+  const auto start = Clock::now();
+  const Range range = push(g_verts, data, length, 0);
+  if (portmaster_upload_stats_enabled()) {
+    ++s_portmasterUploadStats.pushVertCalls;
+    s_portmasterUploadStats.pushVertBytes += length;
+    s_portmasterUploadStats.pushVertUs += portmaster_elapsed_us(start);
+  }
+  return range;
+}
+Range push_indices(const uint8_t* data, size_t length) {
+  const auto start = Clock::now();
+  const Range range = push(g_indices, data, length, 0);
+  if (portmaster_upload_stats_enabled()) {
+    ++s_portmasterUploadStats.pushIndexCalls;
+    s_portmasterUploadStats.pushIndexBytes += length;
+    s_portmasterUploadStats.pushIndexUs += portmaster_elapsed_us(start);
+  }
+  return range;
+}
 
 static std::pair<Range, bool> reserve_portmaster_cache_range(uint32_t& cursor, uint32_t limit, size_t length,
                                                              size_t alignment) noexcept {
@@ -1297,7 +1688,9 @@ std::pair<Range, bool> push_portmaster_cached_verts(const uint8_t* data, size_t 
 
   std::vector<uint8_t> padded(range.size);
   std::memcpy(padded.data(), data, length);
+  const auto writeBufferStart = Clock::now();
   g_queue.WriteBuffer(g_vertexBuffer, range.offset, padded.data(), padded.size());
+  const uint64_t writeBufferUs = portmaster_elapsed_us(writeBufferStart);
 
   const uint32_t rows = range.size / PortmasterCacheRowBytes;
   const wgpu::TexelCopyBufferLayout layout{
@@ -1319,7 +1712,14 @@ std::pair<Range, bool> push_portmaster_cached_verts(const uint8_t* data, size_t 
       .height = rows,
       .depthOrArrayLayers = 1,
   };
+  const auto writeTextureStart = Clock::now();
   g_queue.WriteTexture(&dst, padded.data(), padded.size(), &layout, &size);
+  const uint64_t writeTextureUs = portmaster_elapsed_us(writeTextureStart);
+  if (portmaster_upload_stats_enabled()) {
+    s_portmasterUploadStats.cacheVertexBytes += padded.size();
+    s_portmasterUploadStats.cacheVertexWriteBufferUs += writeBufferUs;
+    s_portmasterUploadStats.cacheVertexWriteTextureUs += writeTextureUs;
+  }
   return {range, true};
 }
 
@@ -1330,12 +1730,34 @@ std::pair<Range, bool> push_portmaster_cached_indices(const uint8_t* data, size_
   }
   std::vector<uint8_t> padded(range.size);
   std::memcpy(padded.data(), data, length);
+  const auto writeBufferStart = Clock::now();
   g_queue.WriteBuffer(g_indexBuffer, range.offset, padded.data(), padded.size());
+  const uint64_t writeBufferUs = portmaster_elapsed_us(writeBufferStart);
+  if (portmaster_upload_stats_enabled()) {
+    s_portmasterUploadStats.cacheIndexBytes += padded.size();
+    s_portmasterUploadStats.cacheIndexWriteBufferUs += writeBufferUs;
+  }
   return {range, true};
 }
 
 Range push_uniform(const uint8_t* data, size_t length) {
   return push(g_uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
+}
+bool uniform_ranges_equal_skipping_prefix(Range lhs, Range rhs, uint32_t skipBytes) noexcept {
+  if (lhs.size != rhs.size || lhs.size < skipBytes) {
+    return false;
+  }
+  if (static_cast<size_t>(lhs.offset) + lhs.size > g_uniforms.size() ||
+      static_cast<size_t>(rhs.offset) + rhs.size > g_uniforms.size()) {
+    return false;
+  }
+  const size_t compareSize = static_cast<size_t>(lhs.size - skipBytes);
+  if (compareSize == 0) {
+    return true;
+  }
+  const auto* lhsData = g_uniforms.data() + lhs.offset + skipBytes;
+  const auto* rhsData = g_uniforms.data() + rhs.offset + skipBytes;
+  return std::memcmp(lhsData, rhsData, compareSize) == 0;
 }
 Range push_storage(const uint8_t* data, size_t length) {
   return push(g_storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment);

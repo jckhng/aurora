@@ -12,6 +12,7 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,22 @@
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
 static PortmasterTimingStats s_portmasterTimingStats{};
+static bool s_portmasterLastPipelineValid = false;
+static PipelineConfig s_portmasterLastPipelineConfig{};
+static gfx::PipelineRef s_portmasterLastPipelineRef{};
+
+struct PortmasterPipelineConfigHash {
+  size_t operator()(const PipelineConfig& config) const noexcept { return xxh3_hash(config); }
+};
+
+struct PortmasterPipelineConfigEq {
+  bool operator()(const PipelineConfig& lhs, const PipelineConfig& rhs) const noexcept {
+    return std::memcmp(&lhs, &rhs, sizeof(PipelineConfig)) == 0;
+  }
+};
+
+static absl::flat_hash_map<PipelineConfig, gfx::PipelineRef, PortmasterPipelineConfigHash, PortmasterPipelineConfigEq>
+    s_portmasterPipelineRefCache{};
 
 static bool portmaster_gx_debug_enabled() {
   static const bool enabled = [] {
@@ -48,6 +65,47 @@ static bool portmaster_gx_stats_enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
   }();
   return enabled;
+}
+
+static bool portmaster_draw_setup_stats_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_DRAW_SETUP_STATS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+using PortmasterClock = std::chrono::steady_clock;
+
+static uint64_t portmaster_elapsed_us(PortmasterClock::time_point start) noexcept {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(PortmasterClock::now() - start).count());
+}
+
+static gfx::PipelineRef portmaster_pipeline_ref_fast(const PipelineConfig& config) {
+  static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+  if (s_portmasterLastPipelineValid &&
+      std::memcmp(&s_portmasterLastPipelineConfig, &config, sizeof(PipelineConfig)) == 0) {
+    ++s_portmasterTimingStats.pipelineFastPathHits;
+    return s_portmasterLastPipelineRef;
+  }
+
+  ++s_portmasterTimingStats.pipelineFastPathMisses;
+  auto cacheIt = s_portmasterPipelineRefCache.find(config);
+  if (cacheIt != s_portmasterPipelineRefCache.end()) {
+    ++s_portmasterTimingStats.pipelineRefCacheHits;
+    s_portmasterLastPipelineConfig = config;
+    s_portmasterLastPipelineRef = cacheIt->second;
+    s_portmasterLastPipelineValid = true;
+    return cacheIt->second;
+  }
+
+  ++s_portmasterTimingStats.pipelineRefCacheMisses;
+  const auto ref = gfx::pipeline_ref(config);
+  s_portmasterPipelineRefCache.try_emplace(config, ref);
+  s_portmasterLastPipelineConfig = config;
+  s_portmasterLastPipelineRef = ref;
+  s_portmasterLastPipelineValid = true;
+  return ref;
 }
 
 enum PortmasterDirtyReason : u32 {
@@ -199,6 +257,20 @@ static void portmaster_mark_tev_reg_dirty(u32 idx, bool isKColor) noexcept {
   } else {
     s_portmasterPendingTevRegMask |= 1u << idx;
   }
+}
+
+static bool portmaster_loaded_texture_matches(const GXTexObj_& slot, const void* data, u32 width, u32 height,
+                                              GXTexFmt format, GXTlut tlut, bool hasMips, u32 texObjId,
+                                              u32 texDataVersion) noexcept {
+  return slot.data == data && slot.mWidth == width && slot.mHeight == height && slot.mFormat == format &&
+         slot.tlut == tlut && slot.has_mips() == (hasMips ? GX_TRUE : GX_FALSE) && slot.texObjId == texObjId &&
+         slot.texDataVersion == texDataVersion && !slot.no_cache();
+}
+
+static bool portmaster_loaded_tlut_matches(const GXTlutObj_& slot, const void* data, GXTlutFmt format, u16 entries,
+                                           u32 tlutObjId, u32 tlutDataVersion) noexcept {
+  return slot.data == data && slot.format == format && slot.numEntries == entries && slot.tlutObjId == tlutObjId &&
+         slot.tlutDataVersion == tlutDataVersion && !slot.no_cache();
 }
 
 static void portmaster_resolve_deferred_tev_reg_dirty(const ShaderInfo& info) noexcept {
@@ -1934,7 +2006,7 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
                                  bool forceNativePosColor = false, const ShaderConfig* forcedNativeShaderConfig = nullptr,
                                  bool forceTextureVertexFetch = false, gfx::Range forcedIdxRange = {},
-                                 u32 forcedIndexCount = 0);
+                                 u32 forcedIndexCount = 0, bool dirtyMergeProbe = false);
 
 struct CpuExpandedDraw {
   ByteBuffer vertices;
@@ -2108,6 +2180,7 @@ static bool portmaster_is_mergeable_primitive(GXPrimitive prim) noexcept {
 static void portmaster_log_layout_stats_and_reset();
 
 PortmasterTimingStats take_portmaster_timing_stats() noexcept {
+  s_portmasterTimingStats.pipelineRefCacheSize = s_portmasterPipelineRefCache.size();
   const auto stats = s_portmasterTimingStats;
   s_portmasterTimingStats = {};
   portmaster_log_layout_stats_and_reset();
@@ -2649,6 +2722,14 @@ static bool portmaster_batch_quads_enabled() noexcept {
   return enabled;
 }
 
+static bool portmaster_skip_line_primitives_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_SKIP_LINE_PRIMS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
 static ByteBuffer handle_draw_strip_batch_vtx_buf;
 static ByteBuffer handle_draw_strip_batch_idx_buf;
 static ByteBuffer handle_draw_quad_batch_vtx_buf;
@@ -2729,6 +2810,50 @@ static PortmasterBatchReuseKey portmaster_make_batch_reuse_key(GXPrimitive prim,
   };
 }
 
+static u32 portmaster_estimate_generated_index_bytes(GXPrimitive prim, u16 vtxCount) noexcept {
+  if (prim == GX_TRIANGLES && portmaster_nonindexed_triangles_enabled()) {
+    return 0;
+  }
+  if (prim == GX_TRIANGLESTRIP && vtxCount >= 3 && portmaster_strip_topology_enabled()) {
+    return static_cast<u32>(vtxCount) * sizeof(u16);
+  }
+  switch (prim) {
+  case GX_QUADS:
+    return static_cast<u32>(vtxCount / 4) * 6u * sizeof(u16);
+  case GX_TRIANGLEFAN:
+    return vtxCount >= 3 ? static_cast<u32>(vtxCount - 2) * 3u * sizeof(u16) : 0;
+  case GX_TRIANGLESTRIP:
+    return vtxCount >= 3 ? static_cast<u32>(vtxCount - 2) * 3u * sizeof(u16) : 0;
+  case GX_LINES:
+  case GX_LINESTRIP:
+  case GX_POINTS:
+  case GX_TRIANGLES:
+    return static_cast<u32>(vtxCount) * sizeof(u16);
+  default:
+    return static_cast<u32>(vtxCount) * sizeof(u16);
+  }
+}
+
+static PortmasterBatchReuseKey portmaster_make_raw_reuse_key(GXPrimitive prim, GXVtxFmt fmt, u32 fifoStride,
+                                                             const u8* vertexBytes, u32 vertexByteCount,
+                                                             u16 vtxCount) noexcept {
+  const u32 indexBytes = portmaster_estimate_generated_index_bytes(prim, vtxCount);
+  const u64 indexModeHash = (static_cast<u64>(vtxCount) << 32) |
+                            (prim == GX_TRIANGLESTRIP && vtxCount >= 3 && portmaster_strip_topology_enabled()
+                                 ? 1ull
+                                 : 0ull) |
+                            (prim == GX_TRIANGLES && portmaster_nonindexed_triangles_enabled() ? 2ull : 0ull);
+  return PortmasterBatchReuseKey{
+      .prim = prim,
+      .fmt = fmt,
+      .fifoStride = fifoStride,
+      .vertexBytes = vertexByteCount,
+      .indexBytes = indexBytes,
+      .vertexHash = portmaster_hash_bytes(vertexBytes, vertexByteCount),
+      .indexHash = indexModeHash,
+  };
+}
+
 static PortmasterBatchReuseKey portmaster_make_strip_batch_topology_key(GXVtxFmt fmt, u32 fifoStride,
                                                                         const ByteBuffer& vertexBytes,
                                                                         const std::vector<u16>& stripCounts) noexcept {
@@ -2764,6 +2889,52 @@ static void portmaster_note_batch_reuse_candidate(GXPrimitive prim, GXVtxFmt fmt
   if (inserted) {
     ++s_portmasterTimingStats.batchReuseMisses;
     if (s_portmasterBatchReuseSeen.size() > 8192) {
+      s_portmasterBatchReuseSeen.clear();
+    }
+    return;
+  }
+
+  if (it->second.lastFrame == frame) {
+    ++s_portmasterTimingStats.batchReuseSameFrameHits;
+  } else {
+    ++s_portmasterTimingStats.batchReuseCrossFrameHits;
+  }
+  ++it->second.count;
+  it->second.lastFrame = frame;
+  ++s_portmasterTimingStats.batchReuseHits;
+  s_portmasterTimingStats.batchReuseAvoidableBytes += totalBytes;
+}
+
+static bool portmaster_unbatched_reuse_probe_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("DUSKLIGHT_PORTMASTER_UNBATCHED_REUSE_PROBE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+static void portmaster_note_unbatched_reuse_candidate(GXPrimitive prim, GXVtxFmt fmt, u32 fifoStride,
+                                                      const u8* vertexBytes, u32 vertexByteCount,
+                                                      u16 vtxCount) noexcept {
+  if (!portmaster_unbatched_reuse_probe_enabled()) {
+    return;
+  }
+  const size_t totalBytes = static_cast<size_t>(vertexByteCount) +
+                            portmaster_estimate_generated_index_bytes(prim, vtxCount);
+  if (totalBytes < 4096) {
+    return;
+  }
+
+  ++s_portmasterTimingStats.batchReuseCandidates;
+  s_portmasterTimingStats.batchReuseBytes += totalBytes;
+
+  const auto key = portmaster_make_raw_reuse_key(prim, fmt, fifoStride, vertexBytes, vertexByteCount, vtxCount);
+  const u32 frame = gfx::current_frame();
+  auto [it, inserted] =
+      s_portmasterBatchReuseSeen.emplace(key, PortmasterBatchReuseEntry{.count = 1, .lastFrame = frame});
+  if (inserted) {
+    ++s_portmasterTimingStats.batchReuseMisses;
+    if (s_portmasterBatchReuseSeen.size() > 16384) {
       s_portmasterBatchReuseSeen.clear();
     }
     return;
@@ -2892,6 +3063,11 @@ static void handle_draw_payload(u8 cmd, const u8* data, u32& pos, u32 size, bool
   const bool portmasterNoVertexStorage = portmaster_no_vertex_storage_mode();
   const bool forceTextureVertexFetch = portmasterNoVertexStorage && portmaster_texture_vertex_fetch_mode();
   portmaster_note_timing_fifo(totalVtxBytes);
+  if (portmaster_skip_line_primitives_enabled() &&
+      (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS)) {
+    pos += totalVtxBytes;
+    return;
+  }
   if (portmasterNoVertexStorage && !forceTextureVertexFetch && can_expand_direct_pos_tex(fmt, vtxSize)) {
     if (portmaster_gx_debug_log_allowed()) {
       Log.info("PortMaster GX expand DIRECT POS+TEX0 draw: prim={} fmt={} vtxCount={} fifoStride={}",
@@ -3080,9 +3256,8 @@ static void handle_draw_payload(u8 cmd, const u8* data, u32& pos, u32 size, bool
     handle_draw_quad_batch_idx_buf.clear();
   }
 
-  // Push raw vertex data to buffer
-  gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes);
   if (forceTextureVertexFetch) {
+    portmaster_note_unbatched_reuse_candidate(prim, fmt, vtxSize, data + pos, totalVtxBytes, vtxCount);
     if (portmaster_gx_debug_log_allowed()) {
       Log.info("PortMaster GX texture vertex fetch draw: prim={} fmt={} vtxCount={} fifoStride={}",
                static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize);
@@ -3093,6 +3268,9 @@ static void handle_draw_payload(u8 cmd, const u8* data, u32& pos, u32 size, bool
     portmaster_note_timing_storage_vertex();
     portmaster_note_layout_stat(prim, fmt, vtxSize, vtxCount, 0, PortmasterExpandPath::StorageVertex);
   }
+
+  // Push raw vertex data to buffer.
+  gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes);
   pos += totalVtxBytes;
 
   // Try to merge with previous draw call.
@@ -3114,7 +3292,7 @@ static void handle_draw_payload(u8 cmd, const u8* data, u32& pos, u32 size, bool
   if (g_gxState.stateDirty) UNLIKELY {
     ++s_portmasterTimingStats.mergeBlockedStateDirty;
     portmaster_note_dirty_merge_block();
-    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, nullptr, forceTextureVertexFetch);
+    handle_draw_unmerged(prim, fmt, vtxCount, vertRange, false, nullptr, forceTextureVertexFetch, {}, 0, true);
     return;
   }
 
@@ -3198,10 +3376,70 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
 static ByteBuffer handle_draw_unmerged_idxBuf;
 
+static void portmaster_probe_dirty_merge_candidate(const DrawData& draw) noexcept {
+  ++s_portmasterTimingStats.dirtyMergeProbeCandidates;
+
+  auto* lastDraw = gfx::get_last_draw_command<DrawData>();
+  if (lastDraw == nullptr) {
+    ++s_portmasterTimingStats.dirtyMergeProbeNoPrevious;
+    return;
+  }
+
+  if (!portmaster_is_mergeable_primitive(draw.primitive) || lastDraw->instanceCount != 1 || draw.instanceCount != 1 ||
+      lastDraw->textureVertexFetch != draw.textureVertexFetch ||
+      lastDraw->triangleStripTopology != draw.triangleStripTopology ||
+      lastDraw->nativeVertexFetch != draw.nativeVertexFetch) {
+    ++s_portmasterTimingStats.dirtyMergeProbePrimitive;
+    return;
+  }
+
+  const bool drawNonIndexedTriangles =
+      draw.primitive == GX_TRIANGLES && portmaster_nonindexed_triangles_enabled() && draw.idxRange.size == 0;
+  if (lastDraw->idxRange.size == 0 && !drawNonIndexedTriangles) {
+    ++s_portmasterTimingStats.dirtyMergeProbePrimitive;
+    return;
+  }
+
+  if (lastDraw->pipeline != draw.pipeline || lastDraw->dstAlpha != draw.dstAlpha) {
+    ++s_portmasterTimingStats.dirtyMergeProbePipeline;
+    return;
+  }
+
+  if (lastDraw->bindGroups.textureBindGroup != draw.bindGroups.textureBindGroup) {
+    ++s_portmasterTimingStats.dirtyMergeProbeBind;
+    return;
+  }
+
+  if (lastDraw->uniformRange.size != draw.uniformRange.size) {
+    ++s_portmasterTimingStats.dirtyMergeProbeUniformSize;
+    return;
+  }
+
+  if (!gfx::uniform_ranges_equal_skipping_prefix(lastDraw->uniformRange, draw.uniformRange, sizeof(u32))) {
+    ++s_portmasterTimingStats.dirtyMergeProbeUniformDifferent;
+    return;
+  }
+
+  ++s_portmasterTimingStats.dirtyMergeProbeUniformSame;
+  ++s_portmasterTimingStats.dirtyMergeProbeCouldMerge;
+}
+
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
                                  bool forceNativePosColor, const ShaderConfig* forcedNativeShaderConfig,
-                                 bool forceTextureVertexFetch, gfx::Range forcedIdxRange, u32 forcedIndexCount) {
+                                 bool forceTextureVertexFetch, gfx::Range forcedIdxRange, u32 forcedIndexCount,
+                                 bool dirtyMergeProbe) {
   ZoneScoped;
+  const bool setupStats = portmaster_draw_setup_stats_enabled();
+  const auto setupStart = setupStats ? PortmasterClock::now() : PortmasterClock::time_point{};
+  auto sectionStart = setupStart;
+  const auto markSection = [&](u64& target) {
+    if (!setupStats) {
+      return;
+    }
+    const auto now = PortmasterClock::now();
+    target += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - sectionStart).count());
+    sectionStart = now;
+  };
   u32 numIndices = 0;
   gfx::Range idxRange;
   const bool useStripTopology =
@@ -3226,6 +3464,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
     idxRange = gfx::push_indices(realBuf.data(), realBuf.size());
     realBuf.clear();
   }
+  markSection(s_portmasterTimingStats.drawSetupIndexUs);
 
   // Build pipeline, bind groups, and push draw command
   BindGroupRanges ranges{};
@@ -3242,6 +3481,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
       array.cachedRange = range;
     }
   }
+  markSection(s_portmasterTimingStats.drawSetupArrayUs);
 
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt);
@@ -3316,10 +3556,15 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
     config.shaderConfig.textureVertexFetch = true;
     config.shaderConfig.lineMode = 0;
   }
+  markSection(s_portmasterTimingStats.drawSetupConfigUs);
   const auto info = build_shader_info(config.shaderConfig);
+  markSection(s_portmasterTimingStats.drawSetupInfoUs);
   resolve_sampled_textures(info);
+  markSection(s_portmasterTimingStats.drawSetupTextureUs);
   const auto bindGroups = build_bind_groups(info);
-  const auto pipeline = gfx::pipeline_ref(config);
+  markSection(s_portmasterTimingStats.drawSetupBindUs);
+  const auto pipeline = portmaster_pipeline_ref_fast(config);
+  markSection(s_portmasterTimingStats.drawSetupPipelineUs);
 
   uint32_t instanceCount = 1;
   if (prim == GX_LINES) {
@@ -3329,20 +3574,33 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   } else if (prim == GX_POINTS) {
     instanceCount = vtxCount;
   }
-  gfx::push_draw_command(DrawData{
+  const auto uniformRange = build_uniform(info, vertRange.offset, ranges);
+  markSection(s_portmasterTimingStats.drawSetupUniformUs);
+  const DrawData draw{
       .pipeline = pipeline,
       .vertRange = vertRange,
       .idxRange = idxRange,
-      .uniformRange = build_uniform(info, vertRange.offset, ranges),
+      .uniformRange = uniformRange,
       .vtxCount = vtxCount,
       .indexCount = numIndices,
       .instanceCount = instanceCount,
       .bindGroups = bindGroups,
       .dstAlpha = g_gxState.dstAlpha,
+      .primitive = prim,
+      .vtxFmt = fmt,
       .nativeVertexFetch = config.shaderConfig.nativeVertexFetch != 0,
       .textureVertexFetch = config.shaderConfig.textureVertexFetch != 0,
       .triangleStripTopology = config.triangleStripTopology != 0,
-  });
+  };
+  if (dirtyMergeProbe) {
+    portmaster_probe_dirty_merge_candidate(draw);
+  }
+  gfx::push_draw_command(draw);
+  markSection(s_portmasterTimingStats.drawSetupPushUs);
+  if (setupStats) {
+    ++s_portmasterTimingStats.drawSetupCalls;
+    s_portmasterTimingStats.drawSetupTotalUs += portmaster_elapsed_us(setupStart);
+  }
   s_portmasterDirtyReasons = 0;
   s_portmasterBpDirtyReasons = 0;
   s_portmasterXfDirtyReasons = 0;
@@ -3492,27 +3750,42 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const auto texMapId = data[pos];
     pos += 1;
     CHECK(texMapId < MaxTextures, "invalid texture map id {}", texMapId);
-    auto& slot = g_gxState.loadedTextures[texMapId];
-    slot.data = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    const auto texData = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
     pos += 8;
-    slot.mWidth = read_u32(data + pos, bigEndian);
+    const auto width = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.mHeight = read_u32(data + pos, bigEndian);
+    const auto height = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.mFormat = static_cast<GXTexFmt>(read_u32(data + pos, bigEndian));
+    const auto format = static_cast<GXTexFmt>(read_u32(data + pos, bigEndian));
     pos += 4;
-    slot.tlut = static_cast<GXTlut>(read_u32(data + pos, bigEndian));
+    const auto tlut = static_cast<GXTlut>(read_u32(data + pos, bigEndian));
     pos += 4;
-    if (data[pos] != 0) {
+    const bool hasMips = data[pos] != 0;
+    pos += 1;
+    const auto texObjId = read_u32(data + pos, bigEndian);
+    pos += 4;
+    const auto texDataVersion = read_u32(data + pos, bigEndian);
+    pos += 4;
+
+    auto& slot = g_gxState.loadedTextures[texMapId];
+    if (portmaster_loaded_texture_matches(slot, texData, width, height, format, tlut, hasMips, texObjId,
+                                          texDataVersion)) {
+      ++s_portmasterTimingStats.textureLoadSkips;
+      return;
+    }
+
+    slot.data = texData;
+    slot.mWidth = width;
+    slot.mHeight = height;
+    slot.mFormat = format;
+    slot.tlut = tlut;
+    if (hasMips) {
       slot.flags |= 1u;
     } else {
       slot.flags &= ~1u;
     }
-    pos += 1;
-    slot.texObjId = read_u32(data + pos, bigEndian);
-    pos += 4;
-    slot.texDataVersion = read_u32(data + pos, bigEndian);
-    pos += 4;
+    slot.texObjId = texObjId;
+    slot.texDataVersion = texDataVersion;
     slot.set_no_cache(false); // Reset no-cache flag
     portmaster_mark_state_dirty(PortmasterDirtyTexture);
   } else if (subCmd == GX_LOAD_AURORA_TLUT) {
@@ -3520,17 +3793,28 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const auto idx = data[pos];
     pos += 1;
     CHECK(idx < MaxTluts, "invalid tlut slot {}", idx);
-    auto& slot = g_gxState.loadedTluts[idx];
-    slot.data = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    const auto tlutData = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
     pos += 8;
-    slot.format = static_cast<GXTlutFmt>(read_u32(data + pos, bigEndian));
+    const auto format = static_cast<GXTlutFmt>(read_u32(data + pos, bigEndian));
     pos += 4;
-    slot.numEntries = read_u16(data + pos, bigEndian);
+    const auto entries = read_u16(data + pos, bigEndian);
     pos += 2;
-    slot.tlutObjId = read_u32(data + pos, bigEndian);
+    const auto tlutObjId = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.tlutDataVersion = read_u32(data + pos, bigEndian);
+    const auto tlutDataVersion = read_u32(data + pos, bigEndian);
     pos += 4;
+
+    auto& slot = g_gxState.loadedTluts[idx];
+    if (portmaster_loaded_tlut_matches(slot, tlutData, format, entries, tlutObjId, tlutDataVersion)) {
+      ++s_portmasterTimingStats.tlutLoadSkips;
+      return;
+    }
+
+    slot.data = tlutData;
+    slot.format = format;
+    slot.numEntries = entries;
+    slot.tlutObjId = tlutObjId;
+    slot.tlutDataVersion = tlutDataVersion;
     slot.set_no_cache(false); // Reset no-cache flag
     portmaster_mark_state_dirty(PortmasterDirtyTexture);
   } else if (subCmd == GX2_SET_POLYGON_OFFSET) {

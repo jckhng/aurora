@@ -210,7 +210,88 @@ std::optional<Command> Reader::next() {
     if (start + 3 > mSize) {
       return fail("Aurora subcommand overrun");
     }
-    if (read_be16(mData + start + 1) != GX_AURORA_DRAW_INDEXED) {
+    const u16 subCmd = read_be16(mData + start + 1);
+    if (subCmd == GX_AURORA_DRAW_SIZED) {
+      if (start + 8 > mSize) {
+        return fail("DRAW_SIZED header overrun");
+      }
+      const u8 drawCmd = mData[start + 3];
+      const auto fmt = static_cast<GXVtxFmt>(drawCmd & GX_VAT_MASK);
+      const u32 byteLen = read_be32(mData + start + 4);
+      const VtxLayout* lo = layout(fmt);
+      if (lo == nullptr) {
+        return fail("no layout for DRAW_SIZED vertex format");
+      }
+      if (lo->stride == 0 || byteLen % lo->stride != 0) {
+        return fail("DRAW_SIZED byte length is not divisible by vertex stride");
+      }
+      const u32 vtxCount = byteLen / lo->stride;
+      if (vtxCount > 0xffffu) {
+        return fail("DRAW_SIZED vertex count overflow");
+      }
+      const u32 cmdSize = 8 + byteLen;
+      if (start + cmdSize > mSize) {
+        return fail("DRAW_SIZED data overrun");
+      }
+      mPos = start + cmdSize;
+      return Command{
+          Command::Kind::Draw,
+          mData + start,
+          cmdSize,
+          DrawCmd{
+              static_cast<GXPrimitive>(drawCmd & GX_OPCODE_MASK),
+              fmt,
+              static_cast<u16>(vtxCount),
+              mData + start + 8,
+              lo,
+              nullptr,
+              0,
+          },
+      };
+    }
+    const auto aurora_passthrough = [&](u32 payloadSize) -> std::optional<Command> {
+      const u32 cmdSize = 3 + payloadSize;
+      if (start + cmdSize > mSize) {
+        return fail("Aurora command overrun");
+      }
+      mPos = start + cmdSize;
+      return Command{Command::Kind::Passthrough, mData + start, cmdSize, {}};
+    };
+    if (subCmd == GX_LOAD_AURORA_VIEWPORT_RENDER) {
+      return aurora_passthrough(24);
+    }
+    if (subCmd == GX_LOAD_AURORA_SCISSOR_RENDER) {
+      return aurora_passthrough(16);
+    }
+    if (subCmd >= GX_LOAD_AURORA_ARRAYBASE && subCmd <= (GX_LOAD_AURORA_ARRAYBASE | 0x0f)) {
+      return aurora_passthrough(13);
+    }
+    if (subCmd == GX_LOAD_AURORA_TEXOBJ) {
+      return aurora_passthrough(34);
+    }
+    if (subCmd == GX_LOAD_AURORA_TLUT) {
+      return aurora_passthrough(23);
+    }
+    if (subCmd == GX_LOAD_AURORA_DESTROY_TEXOBJ || subCmd == GX_LOAD_AURORA_DESTROY_TLUT) {
+      return aurora_passthrough(4);
+    }
+    if (subCmd == GX_LOAD_AURORA_DESTROY_COPY_TEX) {
+      return aurora_passthrough(8);
+    }
+    if (subCmd == GX_LOAD_AURORA_DEBUG_GROUP_POP) {
+      return aurora_passthrough(0);
+    }
+    if (subCmd == GX_LOAD_AURORA_DEBUG_GROUP_PUSH || subCmd == GX_LOAD_AURORA_DEBUG_MARKER_INSERT) {
+      if (start + 5 > mSize) {
+        return fail("Aurora debug string header overrun");
+      }
+      const u16 len = read_be16(mData + start + 3);
+      return aurora_passthrough(2 + len);
+    }
+    if (subCmd == GX2_SET_POLYGON_OFFSET) {
+      return aurora_passthrough(20);
+    }
+    if (subCmd != GX_AURORA_DRAW_INDEXED) {
       return fail("unsupported Aurora subcommand");
     }
     if (start + 10 > mSize) {

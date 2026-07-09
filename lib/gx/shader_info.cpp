@@ -2,6 +2,7 @@
 
 #include <cmath>
 
+#include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
 namespace aurora::gx {
@@ -26,6 +27,10 @@ Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
   }
   return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
 }
+
+struct ShaderConfigHash {
+  size_t operator()(const ShaderConfig& config) const noexcept { return xxh3_hash(config); }
+};
 
 void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {
   switch (arg) {
@@ -176,7 +181,7 @@ void alpha_arg_reg_info(GXTevAlphaArg arg, const TevStage& stage, ShaderInfo& in
 }
 } // namespace
 
-ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+static ShaderInfo build_shader_info_uncached(const ShaderConfig& config) noexcept {
   ZoneScoped;
 
   ShaderInfo info{
@@ -315,6 +320,16 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
   }
   return info;
+}
+
+ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+  ZoneScoped;
+  static absl::flat_hash_map<ShaderConfig, ShaderInfo, ShaderConfigHash> cache;
+  auto [it, inserted] = cache.try_emplace(config);
+  if (inserted) {
+    it->second = build_shader_info_uncached(config);
+  }
+  return it->second;
 }
 
 static f32 tex_offset(GXTexOffset offs) noexcept {

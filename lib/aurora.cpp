@@ -34,11 +34,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <string>
 #include <vector>
 
 namespace aurora {
@@ -127,6 +130,177 @@ static void note_portmaster_end_frame_timing(uint64_t drainUs, uint64_t gfxEndUs
 using webgpu::g_device;
 using webgpu::g_queue;
 using webgpu::g_surface;
+
+namespace portmaster_renderdoc {
+using RENDERDOC_DevicePointer = void*;
+using RENDERDOC_WindowHandle = void*;
+using pRENDERDOC_GetAPIVersion = void (*)(int* major, int* minor, int* patch);
+using pRENDERDOC_SetCaptureFilePathTemplate = void (*)(const char* pathtemplate);
+using pRENDERDOC_TriggerCapture = void (*)();
+using pRENDERDOC_StartFrameCapture = void (*)(RENDERDOC_DevicePointer device, RENDERDOC_WindowHandle wndHandle);
+using pRENDERDOC_EndFrameCapture = uint32_t (*)(RENDERDOC_DevicePointer device, RENDERDOC_WindowHandle wndHandle);
+using pRENDERDOC_GetAPI = int (*)(int version, void** outAPIPointers);
+
+struct Api {
+  pRENDERDOC_GetAPIVersion GetAPIVersion = nullptr;
+  void* SetCaptureOptionU32 = nullptr;
+  void* SetCaptureOptionF32 = nullptr;
+  void* GetCaptureOptionU32 = nullptr;
+  void* GetCaptureOptionF32 = nullptr;
+  void* SetFocusToggleKeys = nullptr;
+  void* SetCaptureKeys = nullptr;
+  void* GetOverlayBits = nullptr;
+  void* MaskOverlayBits = nullptr;
+  void* RemoveHooks = nullptr;
+  void* UnloadCrashHandler = nullptr;
+  pRENDERDOC_SetCaptureFilePathTemplate SetCaptureFilePathTemplate = nullptr;
+  void* GetCaptureFilePathTemplate = nullptr;
+  void* GetNumCaptures = nullptr;
+  void* GetCapture = nullptr;
+  pRENDERDOC_TriggerCapture TriggerCapture = nullptr;
+  void* IsTargetControlConnected = nullptr;
+  void* LaunchReplayUI = nullptr;
+  void* SetActiveWindow = nullptr;
+  pRENDERDOC_StartFrameCapture StartFrameCapture = nullptr;
+  void* IsFrameCapturing = nullptr;
+  pRENDERDOC_EndFrameCapture EndFrameCapture = nullptr;
+};
+
+struct State {
+  bool initialized = false;
+  bool available = false;
+  bool captureStarted = false;
+  bool captureDone = false;
+  uint32_t frame = 0;
+  uint32_t captureAfter = 0;
+  void* library = nullptr;
+  Api* api = nullptr;
+  std::string capturePath;
+};
+
+State g_state;
+
+uint32_t env_u32(const char* name, uint32_t fallback) noexcept {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (end == value) {
+    return fallback;
+  }
+  return static_cast<uint32_t>(parsed);
+}
+
+void mkdir_parents(std::string path) noexcept {
+  if (path.empty()) {
+    return;
+  }
+  for (size_t i = 1; i < path.size(); ++i) {
+    if (path[i] == '/') {
+      path[i] = '\0';
+      mkdir(path.c_str(), 0755);
+      path[i] = '/';
+    }
+  }
+  mkdir(path.c_str(), 0755);
+}
+
+void ensure_capture_dir(const std::string& pathTemplate) noexcept {
+  const auto slash = pathTemplate.find_last_of('/');
+  if (slash == std::string::npos || slash == 0) {
+    return;
+  }
+  mkdir_parents(pathTemplate.substr(0, slash));
+}
+
+bool initialize() noexcept {
+  if (g_state.initialized) {
+    return g_state.available;
+  }
+  g_state.initialized = true;
+  g_state.captureAfter = env_u32("DUSKLIGHT_RENDERDOC_CAPTURE_AFTER", 0);
+  if (g_state.captureAfter == 0) {
+    return false;
+  }
+
+  const char* path = std::getenv("DUSKLIGHT_RENDERDOC_CAPTURE_PATH");
+  g_state.capturePath = (path != nullptr && path[0] != '\0') ? path : "./renderdoc/dusklight";
+  ensure_capture_dir(g_state.capturePath);
+
+  const char* lib = std::getenv("DUSKLIGHT_RENDERDOC_LIB");
+  if (lib == nullptr || lib[0] == '\0') {
+    lib = "librenderdoc.so";
+  }
+
+  g_state.library = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+  if (g_state.library == nullptr) {
+    Log.warn("RenderDoc capture requested but {} could not be loaded: {}", lib, dlerror());
+    return false;
+  }
+
+  auto getApi = reinterpret_cast<pRENDERDOC_GetAPI>(dlsym(g_state.library, "RENDERDOC_GetAPI"));
+  if (getApi == nullptr) {
+    Log.warn("RenderDoc capture requested but RENDERDOC_GetAPI was not found in {}", lib);
+    return false;
+  }
+
+  void* api = nullptr;
+  constexpr int RenderDocApiVersion112 = 10102;
+  if (!getApi(RenderDocApiVersion112, &api) || api == nullptr) {
+    Log.warn("RenderDoc capture requested but API 1.1.2 is unavailable");
+    return false;
+  }
+
+  g_state.api = static_cast<Api*>(api);
+  if (g_state.api->SetCaptureFilePathTemplate != nullptr) {
+    g_state.api->SetCaptureFilePathTemplate(g_state.capturePath.c_str());
+  }
+  int major = 0;
+  int minor = 0;
+  int patch = 0;
+  if (g_state.api->GetAPIVersion != nullptr) {
+    g_state.api->GetAPIVersion(&major, &minor, &patch);
+  }
+  g_state.available = g_state.api->TriggerCapture != nullptr ||
+                      (g_state.api->StartFrameCapture != nullptr && g_state.api->EndFrameCapture != nullptr);
+  Log.info("RenderDoc capture hook {}: lib='{}' api={}.{}.{} capture_after={} path='{}'",
+           g_state.available ? "ready" : "unusable", lib, major, minor, patch, g_state.captureAfter,
+           g_state.capturePath);
+  return g_state.available;
+}
+
+void begin_frame_capture_if_needed() noexcept {
+  if (!initialize() || g_state.captureDone || g_state.captureStarted) {
+    return;
+  }
+  if (g_state.frame < g_state.captureAfter) {
+    ++g_state.frame;
+    return;
+  }
+  if (g_state.api->TriggerCapture != nullptr) {
+    Log.info("RenderDoc trigger capture requested at Aurora frame {}", g_state.frame);
+    g_state.api->TriggerCapture();
+    g_state.captureDone = true;
+    return;
+  }
+  Log.info("RenderDoc capture starting at Aurora frame {}", g_state.frame);
+  g_state.api->StartFrameCapture(nullptr, nullptr);
+  g_state.captureStarted = true;
+}
+
+void end_frame_capture_if_needed() noexcept {
+  if (!g_state.captureStarted || g_state.captureDone || g_state.api == nullptr || g_state.api->EndFrameCapture == nullptr) {
+    return;
+  }
+  const uint32_t ok = g_state.api->EndFrameCapture(nullptr, nullptr);
+  g_state.captureStarted = false;
+  g_state.captureDone = true;
+  Log.info("RenderDoc capture ended at Aurora frame {} result={} path_template='{}'", g_state.frame, ok,
+           g_state.capturePath);
+}
+} // namespace portmaster_renderdoc
 
 namespace portmaster_fbdev {
 struct State {
@@ -1230,6 +1404,9 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   ASSERT(window::initialize_event_watch(), "Error initializing SDL event watch");
 
 #ifdef AURORA_ENABLE_GX
+  // RenderDoc must be loaded before Dawn/EGL create the GL objects it will hook.
+  portmaster_renderdoc::initialize();
+
   /* Attempt to create a window using the calling application's desired backend */
   AuroraBackend selectedBackend = config.desiredBackend;
   bool windowCreated = false;
@@ -1393,6 +1570,7 @@ bool begin_frame() noexcept {
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
+  portmaster_renderdoc::begin_frame_capture_if_needed();
   const bool fbdevPresentThisFrame = portmaster_fbdev::should_present_frame();
   const bool sdlPresentThisFrame = portmaster_sdl_present::should_present_frame();
   const bool externalPresentThisFrame = fbdevPresentThisFrame || sdlPresentThisFrame;
@@ -1519,6 +1697,7 @@ void end_frame() noexcept {
     } else if (g_surface) {
       webgpu::release_surface();
     }
+    portmaster_renderdoc::end_frame_capture_if_needed();
     g_currentView = {};
     note_portmaster_end_frame_timing(elapsed_us(drainStart, drainDone), elapsed_us(gfxEndStart, gfxEndDone),
                                      elapsed_us(renderStart, renderDone), elapsed_us(finishSubmitStart, finishDone),
