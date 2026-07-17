@@ -19,8 +19,10 @@
 #include <bit>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 static aurora::Module Log("aurora::gx");
@@ -43,6 +45,16 @@ static wgpu::PipelineLayout sPipelineLayout;
 wgpu::BindGroup g_emptyTextureBindGroup;
 
 namespace {
+template <typename To, typename From>
+To bit_cast_compat(const From& value) noexcept {
+  static_assert(sizeof(To) == sizeof(From));
+  static_assert(std::is_trivially_copyable_v<To>);
+  static_assert(std::is_trivially_copyable_v<From>);
+  To result;
+  std::memcpy(&result, &value, sizeof(result));
+  return result;
+}
+
 struct DynamicPaletteKey {
   const void* sourceIdentity = nullptr;
   u32 width = 0;
@@ -635,10 +647,11 @@ static inline wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode, bo
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept {
   ZoneScoped;
-  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
-  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
+  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * bit_cast_compat<float>(config.polygonOffsetBits);
+  const float depthBiasSlopeScale =
+      (UseReversedZ ? -1.0f : 1.0f) * bit_cast_compat<float>(config.polygonOffsetScaleBits);
   const float depthBiasClamp = webgpu::g_hasCoreFeatures
-                                   ? std::bit_cast<float>(config.polygonOffsetClampBits)
+                                   ? bit_cast_compat<float>(config.polygonOffsetClampBits)
                                    : 0.0f;
   const wgpu::DepthStencilState depthStencil{
       .format = g_graphicsConfig.depthFormat,
@@ -776,9 +789,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .blendFacDst = g_gxState.blendFacDst,
       .blendOp = g_gxState.blendOp,
       .dstAlpha = g_gxState.dstAlpha,
-      .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
-      .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
-      .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
+      .polygonOffsetBits = bit_cast_compat<uint32_t>(polygonOffset),
+      .polygonOffsetScaleBits = bit_cast_compat<uint32_t>(polygonOffsetScale),
+      .polygonOffsetClampBits = bit_cast_compat<uint32_t>(g_gxState.clamp),
       .depthCompare = g_gxState.depthCompare,
       .depthUpdate = g_gxState.depthUpdate,
       .alphaUpdate = g_gxState.alphaUpdate,

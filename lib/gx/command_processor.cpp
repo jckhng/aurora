@@ -18,10 +18,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
+
+template <typename To, typename From>
+To bit_cast_compat(const From& value) noexcept {
+  static_assert(sizeof(To) == sizeof(From));
+  static_assert(std::is_trivially_copyable_v<To>);
+  static_assert(std::is_trivially_copyable_v<From>);
+  To result;
+  std::memcpy(&result, &value, sizeof(result));
+  return result;
+}
 
 // Bumped by GX_CMD_INVL_VC (GXInvalidateVtxCache); invalidates the memoized attribute
 // array content hashes the native geometry cache keys indexed draws by.
@@ -1841,7 +1852,7 @@ static f32 read_component_as_float(const u8* p, GXCompType type, u8 frac, bool b
   case GX_S16:
     return static_cast<f32>(static_cast<int16_t>(read_u16(p, bigEndian))) * scale;
   case GX_F32:
-    return std::bit_cast<f32>(read_u32(p, bigEndian));
+    return bit_cast_compat<f32>(read_u32(p, bigEndian));
   default:
     return 0.0f;
   }

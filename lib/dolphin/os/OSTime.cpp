@@ -27,22 +27,22 @@ static LocalTime SystemTimeToLocalTime(SystemTime time) {
     const auto fractionalSeconds = chrono::duration_cast<SystemDuration>(time - wholeSeconds);
     std::time_t wallClock = chrono::system_clock::to_time_t(wholeSeconds);
     std::tm localTm{};
+    std::tm gmTm{};
 
 #if defined(_WIN32)
     ASSERT(localtime_s(&localTm, &wallClock) == 0);
+    ASSERT(gmtime_s(&gmTm, &wallClock) == 0);
 #else
     ASSERT(localtime_r(&wallClock, &localTm) != nullptr);
+    ASSERT(gmtime_r(&wallClock, &gmTm) != nullptr);
 #endif
 
-    const auto localDate = chrono::local_days{
-        chrono::year{localTm.tm_year + 1900} / chrono::month{static_cast<unsigned>(localTm.tm_mon + 1)} /
-        chrono::day{static_cast<unsigned>(localTm.tm_mday)}};
-    const auto localTimeOfDay =
-        chrono::hours{localTm.tm_hour} + chrono::minutes{localTm.tm_min} + chrono::seconds{localTm.tm_sec};
+    localTm.tm_isdst = -1;
+    gmTm.tm_isdst = -1;
+    const auto utcOffset = chrono::seconds{std::mktime(&localTm) - std::mktime(&gmTm)};
     return LocalTime{
-        chrono::duration_cast<SystemDuration>(localDate.time_since_epoch()) +
-        chrono::duration_cast<SystemDuration>(localTimeOfDay) +
-        fractionalSeconds};
+        chrono::duration_cast<SystemDuration>(wholeSeconds.time_since_epoch()) +
+        chrono::duration_cast<SystemDuration>(utcOffset) + fractionalSeconds};
 #endif
 }
 
