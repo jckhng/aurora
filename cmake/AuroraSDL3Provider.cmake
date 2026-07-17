@@ -139,12 +139,21 @@ elseif (_aurora_sdl3_provider STREQUAL "vendor")
     endif ()
 
     include(FetchContent)
+    set(AURORA_SDL3_SOURCE_URL
+      "https://github.com/libsdl-org/SDL/archive/${AURORA_SDL3_REF}.tar.gz"
+      CACHE STRING "SDL3 source archive URL for vendor builds")
+    message(STATUS "aurora: SDL3 source URL: ${AURORA_SDL3_SOURCE_URL}")
+    set(_aurora_sdl3_patch_args "")
+    if (AURORA_SDL3_SOURCE_URL MATCHES "github\\.com/libsdl-org/SDL")
+      list(APPEND _aurora_sdl3_patch_args
+        PATCH_COMMAND ${CMAKE_COMMAND}
+          -DSDL_SOURCE_DIR=<SOURCE_DIR>
+          -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-android-nintendo-auto-mapping.cmake")
+    endif ()
     FetchContent_Declare(SDL
-      URL "https://github.com/libsdl-org/SDL/archive/${AURORA_SDL3_REF}.tar.gz"
+      URL "${AURORA_SDL3_SOURCE_URL}"
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      PATCH_COMMAND ${CMAKE_COMMAND}
-        -DSDL_SOURCE_DIR=<SOURCE_DIR>
-        -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-android-nintendo-auto-mapping.cmake"
+      ${_aurora_sdl3_patch_args}
       EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(SDL)
