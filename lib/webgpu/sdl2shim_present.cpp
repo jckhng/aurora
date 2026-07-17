@@ -3,6 +3,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 
 #include <SDL3/SDL_video.h>
@@ -59,11 +60,9 @@ constexpr uint32_t EGL_SYNC_FENCE_KHR = 0x30F9;
 constexpr int32_t EGL_CONDITION_SATISFIED_KHR = 0x30F6;
 constexpr int32_t EGL_TRUE = 1;
 
-// Upper bound on the worker's wait for a slot's reverse fence (the main thread's blit of the
-// previous frame retiring on the GPU). In steady state the fence retired a frame ago and the
-// wait returns immediately; the bound only exists so a wedged fence produces one logged, torn
-// frame instead of a silent hang.
-constexpr uint64_t RevSyncWaitTimeoutNs = 2'000'000'000;
+// Upper bound on CPU waits for cross-context fences. In steady state the fence has already retired;
+// the bound only exists so a wedged fence produces one logged, torn frame instead of a silent hang.
+constexpr uint64_t CrossContextSyncWaitTimeoutNs = 2'000'000'000;
 
 using GlGenTexturesFn = void (*)(int32_t, uint32_t*);
 using GlBindTextureFn = void (*)(uint32_t, uint32_t);
@@ -161,6 +160,14 @@ int32_t g_framesOwed = 0;     // end_frames enqueued but not yet presented/dropp
 bool g_hasReadyFrame = false;
 uint32_t g_readySlot = 0;
 bool g_aborting = false;
+
+bool strict_present_sync() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("AURORA_SDL2SHIM_STRICT_PRESENT_SYNC");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
 
 WGPUDevice device_handle() { return g_device.Get(); }
 
@@ -330,9 +337,18 @@ void blit_and_swap(Slot& slot) {
   int drawableHeight = static_cast<int>(g_height);
   SDL_GetWindowSizeInPixels(window, &drawableWidth, &drawableHeight);
 
-  // Wait, on the GPU, for Dawn to finish rendering this slot. This does not block the CPU.
+  // Some older Mali EGL stacks acknowledge a cross-context server wait before the shared image is
+  // coherent. The strict path waits for completion on the CPU before issuing the blit.
   if (slot.fwdSync != nullptr) {
-    g_gl.WaitSyncKHR(g_display, slot.fwdSync, 0);
+    if (strict_present_sync()) {
+      const int32_t waited =
+          g_gl.ClientWaitSyncKHR(g_display, slot.fwdSync, 0, CrossContextSyncWaitTimeoutNs);
+      if (waited != EGL_CONDITION_SATISFIED_KHR) {
+        Log.warn("[sdl2shim-efb] forward-fence wait returned 0x{:x}; presenting frame anyway", waited);
+      }
+    } else {
+      g_gl.WaitSyncKHR(g_display, slot.fwdSync, 0);
+    }
   }
 
   g_gl.BindFramebuffer(GL_READ_FRAMEBUFFER, slot.readFbo);
@@ -407,6 +423,7 @@ bool initialize(ProcAddressFn getProc, void* eglDisplay, uint32_t width, uint32_
   g_active = true;
   Log.info("[sdl2shim-efb] {}x{} {} EFB slots shared with Dawn via EGLImage; present runs on the main thread",
            width, height, SlotCount);
+  Log.info("[sdl2shim-efb] strict present synchronization {}", strict_present_sync() ? "enabled" : "disabled");
   return true;
 #endif
 }
@@ -494,7 +511,8 @@ std::optional<AcquiredFrame> acquire() {
   // the worker parks holding nothing Dawn can contend on. In steady state the fence retired a
   // frame ago and this returns immediately; on timeout we render anyway (one torn frame, loudly).
   if (slot.revSync != nullptr) {
-    const int32_t waited = g_gl.ClientWaitSyncKHR(g_display, slot.revSync, 0, RevSyncWaitTimeoutNs);
+    const int32_t waited =
+        g_gl.ClientWaitSyncKHR(g_display, slot.revSync, 0, CrossContextSyncWaitTimeoutNs);
     if (waited != EGL_CONDITION_SATISFIED_KHR) {
       Log.warn("[sdl2shim-efb] slot {} reverse-fence wait returned 0x{:x}; rendering into it anyway",
                slotIndex, waited);
