@@ -2267,6 +2267,27 @@ static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffe
   }
 }
 
+// ShaderInfo and PipelineRef are immutable functions of PipelineConfig. Native
+// draws revisit a small set of configurations many thousands of times, so keep
+// a bounded exact-key cache and avoid repeated shader analysis plus the mutexed
+// global pipeline lookup. Dynamic textures, bind groups, and uniforms remain
+// resolved per draw.
+struct NativeDrawSetup {
+  ShaderInfo info;
+  gfx::PipelineRef pipeline;
+};
+struct NativeDrawSetupHash {
+  size_t operator()(const PipelineConfig& config) const noexcept { return static_cast<size_t>(xxh3_hash(config)); }
+};
+struct NativeDrawSetupEqual {
+  bool operator()(const PipelineConfig& lhs, const PipelineConfig& rhs) const noexcept {
+    return std::memcmp(&lhs, &rhs, sizeof(PipelineConfig)) == 0;
+  }
+};
+static absl::flat_hash_map<PipelineConfig, NativeDrawSetup, NativeDrawSetupHash, NativeDrawSetupEqual>
+    s_nativeDrawSetupCache;
+static constexpr size_t kNativeDrawSetupCacheMaxEntries = 4096;
+
 static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                 const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
                                 gfx::Range vertRange, gfx::Range idxRange, u32 numIndices, bool cachedGeometry = false,
@@ -2278,10 +2299,18 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   config.shaderConfig.nativeVertexFetch = 1;
   config.triangleStripTopology = stripTopology ? 1u : 0u;
 
-  const auto info = build_shader_info(config.shaderConfig);
+  const auto setupIt = s_nativeDrawSetupCache.find(config);
+  const bool setupCacheHit = setupIt != s_nativeDrawSetupCache.end();
+  const auto info = setupCacheHit ? setupIt->second.info : build_shader_info(config.shaderConfig);
   resolve_sampled_textures(info);
   const auto bindGroups = build_bind_groups(info);
-  const auto pipeline = gfx::pipeline_ref(config);
+  const auto pipeline = setupCacheHit ? setupIt->second.pipeline : gfx::pipeline_ref(config);
+  if (!setupCacheHit) {
+    if (s_nativeDrawSetupCache.size() >= kNativeDrawSetupCacheMaxEntries) {
+      s_nativeDrawSetupCache.clear();
+    }
+    s_nativeDrawSetupCache.emplace(config, NativeDrawSetup{.info = info, .pipeline = pipeline});
+  }
 
   BindGroupRanges ranges{}; // native resolves indexed attrs on the CPU — no array uploads
   gfx::push_draw_command(DrawData{
